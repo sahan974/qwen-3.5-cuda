@@ -21,6 +21,7 @@ find_package(CUDAToolkit REQUIRED)
 add_executable(qwen-3.5-cuda
     src/main.cpp
     src/loader_gguf.cpp
+    src/cuda/matmul_q8.cu
 )
 
 target_link_libraries(qwen-3.5-cuda PRIVATE CUDA::cublas CUDA::cudart)
