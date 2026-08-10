@@ -146,9 +146,75 @@ bool GgufLoader::open(const std::string& filepath) {
 
         fin.read(reinterpret_cast<char*>(&tensor.offset), sizeof(tensor.offset));
 
+        tensor.size_bytes = calculate_tensor_bytes(tensor.type, tensor.num_elements);
+
         tensors_.push_back(tensor);
     }
 
+    // Align to 32 bytes for binary payload start
+    uint64_t cur_pos = fin.tellg();
+    payload_offset_ = (cur_pos + 31) & ~31;
+
+    return true;
+}
+
+void GgufLoader::unload_gpu() {
+    for (auto& t : tensors_) {
+        if (t.device_ptr != nullptr) {
+            cudaFree(t.device_ptr);
+            t.device_ptr = nullptr;
+        }
+    }
+    total_vram_bytes_ = 0;
+}
+
+bool GgufLoader::load_tensors_to_gpu() {
+    std::ifstream fin(filepath_, std::ios::binary);
+    if (!fin.is_open()) return false;
+
+    total_vram_bytes_ = 0;
+    std::vector<char> buffer;
+
+    std::cout << "Loading " << tensor_count_ << " tensors into GPU VRAM..." << std::endl;
+
+    for (size_t i = 0; i < tensors_.size(); ++i) {
+        auto& t = tensors_[i];
+        
+        // Allocate device VRAM
+        cudaError_t err = cudaMalloc(&t.device_ptr, t.size_bytes);
+        if (err != cudaSuccess) {
+            std::cerr << "CUDA OOM allocating tensor " << t.name << " (" << t.size_bytes << " bytes)" << std::endl;
+            unload_gpu();
+            return false;
+        }
+
+        // Seek to absolute tensor offset in file payload
+        fin.seekg(payload_offset_ + t.offset, std::ios::beg);
+        
+        if (buffer.size() < t.size_bytes) {
+            buffer.resize(t.size_bytes);
+        }
+
+        fin.read(buffer.data(), t.size_bytes);
+        if (!fin.good()) {
+            std::cerr << "Error reading binary tensor data for: " << t.name << std::endl;
+            unload_gpu();
+            return false;
+        }
+
+        // Copy to GPU VRAM
+        err = cudaMemcpy(t.device_ptr, buffer.data(), t.size_bytes, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            std::cerr << "cudaMemcpyHostToDevice failed for: " << t.name << std::endl;
+            unload_gpu();
+            return false;
+        }
+
+        total_vram_bytes_ += t.size_bytes;
+    }
+
+    std::cout << "Successfully loaded all tensors. Total VRAM allocated: " 
+              << (total_vram_bytes_ / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
     return true;
 }
 

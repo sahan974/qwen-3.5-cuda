@@ -28,11 +28,17 @@ int main(int argc, char** argv) {
     }
 
     if (argc > 1) {
-        std::cout << "\n--- Testing GGUF File Parsing ---" << std::endl;
+        std::cout << "\n--- Testing GGUF Tensor Loading to GPU ---" << std::endl;
         std::string gguf_path = argv[1];
         qwen::GgufLoader loader;
         if (loader.open(gguf_path)) {
             loader.print_summary();
+            std::cout << "\nInitiating GPU transfer..." << std::endl;
+            if (loader.load_tensors_to_gpu()) {
+                std::cout << "All tensors safely residing in GPU VRAM!" << std::endl;
+                loader.unload_gpu();
+                std::cout << "VRAM freed successfully." << std::endl;
+            }
         }
     }
 

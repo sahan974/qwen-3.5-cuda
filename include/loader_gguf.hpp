@@ -30,11 +30,14 @@ public:
     ~GgufLoader();
 
     bool open(const std::string& filepath);
+    bool load_tensors_to_gpu();
+    void unload_gpu();
     void close();
 
     uint32_t version() const { return version_; }
     uint64_t tensor_count() const { return tensor_count_; }
     uint64_t metadata_count() const { return metadata_count_; }
+    uint64_t total_vram_bytes() const { return total_vram_bytes_; }
     
     const std::vector<QuantTensor>& tensors() const { return tensors_; }
     const std::unordered_map<std::string, std::string>& metadata() const { return metadata_str_; }
@@ -46,6 +49,8 @@ private:
     uint32_t version_ = 0;
     uint64_t tensor_count_ = 0;
     uint64_t metadata_count_ = 0;
+    uint64_t payload_offset_ = 0;
+    uint64_t total_vram_bytes_ = 0;
     
     std::vector<QuantTensor> tensors_;
     std::unordered_map<std::string, std::string> metadata_str_;
