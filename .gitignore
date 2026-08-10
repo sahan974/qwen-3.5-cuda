@@ -1,0 +1,15 @@
+# Build outputs
+build/
+bin/
+
+# IDE / OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Data / Weights
+data/
+*.gguf
+*.bin
+*.blob
