@@ -20,6 +20,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_executable(qwen-3.5-cuda
     src/main.cpp
+    src/loader_gguf.cpp
 )
 
 target_link_libraries(qwen-3.5-cuda PRIVATE CUDA::cublas CUDA::cudart)
