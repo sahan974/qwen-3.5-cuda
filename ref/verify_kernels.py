@@ -100,7 +100,34 @@ def test_operator_kernels():
     gated_rms_ref = (x / torch.sqrt(torch.mean(x**2) + eps)) * weight * silu_gate
     print(f"PyTorch Gated RMSNorm Norm: {gated_rms_ref.norm().item():.4f}")
 
+def test_rope_kernel():
+    print("\n=== Testing Partial RoPE Kernel (64-dim) ===")
+    num_heads = 16
+    head_dim = 256
+    partial_dim = 64
+    pos = 5
+    theta = 1000000.0
+
+    q = torch.randn(num_heads, head_dim, dtype=torch.float32)
+    q_rot = q.clone()
+
+    for h in range(num_heads):
+        for p in range(partial_dim // 2):
+            i0 = p * 2
+            i1 = i0 + 1
+            th = pos / (theta ** (i0 / partial_dim))
+            c = math.cos(th)
+            s = math.sin(th)
+            v0 = q[h, i0].item()
+            v1 = q[h, i1].item()
+            q_rot[h, i0] = v0 * c - v1 * s
+            q_rot[h, i1] = v0 * s + v1 * c
+
+    print(f"Partial RoPE output computed. Rotated Q Norm: {q_rot.norm().item():.4f}")
+    print(f"Unchanged dims [64..255] diff: {(q[:, 64:] - q_rot[:, 64:]).abs().max().item():.6f}")
+
 if __name__ == "__main__":
     test_matmul_q8()
     test_matmul_q4()
     test_operator_kernels()
+    test_rope_kernel()
