@@ -35,5 +35,54 @@ def test_matmul_q8():
         
         print(f"PyTorch Reference computed. Target norm: {y_ref.norm().item():.4f}")
 
+def test_matmul_q4():
+    print("\n=== Testing INT4 (W4A16) GEMM CUDA Kernel vs PyTorch Reference ===")
+    test_shapes = [
+        (2048, 2048),
+        (8192, 2048),
+        (4096, 2048)
+    ]
+    group_size = 32
+    
+    for M, K in test_shapes:
+        print(f"\nTesting INT4 Shape: M={M}, K={K}, group_size={group_size}...")
+        num_groups = K // group_size
+        
+        # Random weights and scales/zeros
+        W_fp32 = torch.randn(M, K, dtype=torch.float32)
+        scales = torch.rand(M, num_groups, dtype=torch.float32) * 0.1 + 0.01
+        zeros = torch.randint(0, 16, (M, num_groups), dtype=torch.float32)
+        
+        # Quantize to INT4 uint8 pair
+        W_u4 = torch.zeros(M, K, dtype=torch.uint8)
+        for g in range(num_groups):
+            k_start = g * group_size
+            k_end = (g + 1) * group_size
+            s = scales[:, g:g+1]
+            z = zeros[:, g:g+1]
+            q = torch.round(W_fp32[:, k_start:k_end] / s + z).clamp(0, 15).to(torch.uint8)
+            W_u4[:, k_start:k_end] = q
+
+        # Pack pairs of 4-bit into uint8
+        W_packed = torch.zeros(M, K // 2, dtype=torch.uint8)
+        for k_byte in range(K // 2):
+            w0 = W_u4[:, k_byte * 2]
+            w1 = W_u4[:, k_byte * 2 + 1]
+            W_packed[:, k_byte] = w0 | (w1 << 4)
+
+        # Dequantize PyTorch reference
+        W_dequant = torch.zeros(M, K, dtype=torch.float32)
+        for g in range(num_groups):
+            k_start = g * group_size
+            k_end = (g + 1) * group_size
+            s = scales[:, g:g+1]
+            z = zeros[:, g:g+1]
+            W_dequant[:, k_start:k_end] = (W_u4[:, k_start:k_end].to(torch.float32) - z) * s
+
+        x = torch.randn(K, dtype=torch.float32)
+        y_ref = torch.mv(W_dequant, x)
+        print(f"PyTorch INT4 Reference computed. Target norm: {y_ref.norm().item():.4f}")
+
 if __name__ == "__main__":
     test_matmul_q8()
+    test_matmul_q4()

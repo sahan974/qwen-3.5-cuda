@@ -22,6 +22,7 @@ add_executable(qwen-3.5-cuda
     src/main.cpp
     src/loader_gguf.cpp
     src/cuda/matmul_q8.cu
+    src/cuda/matmul_q4.cu
 )
 
 target_link_libraries(qwen-3.5-cuda PRIVATE CUDA::cublas CUDA::cudart)
