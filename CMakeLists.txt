@@ -25,6 +25,7 @@ add_executable(qwen-3.5-cuda
     src/cuda/matmul_q4.cu
     src/cuda/ops.cu
     src/cuda/rope.cu
+    src/cuda/gdn.cu
 )
 
 target_link_libraries(qwen-3.5-cuda PRIVATE CUDA::cublas CUDA::cudart)

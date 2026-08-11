@@ -126,8 +126,36 @@ def test_rope_kernel():
     print(f"Partial RoPE output computed. Rotated Q Norm: {q_rot.norm().item():.4f}")
     print(f"Unchanged dims [64..255] diff: {(q[:, 64:] - q_rot[:, 64:]).abs().max().item():.6f}")
 
+def test_gdn_kernel():
+    print("\n=== Testing Gated DeltaNet (GDN) Recurrent Update Kernel ===")
+    num_heads = 32
+    key_dim = 128
+    value_dim = 128
+
+    state = torch.zeros(num_heads, key_dim, value_dim, dtype=torch.float32)
+    q = torch.randn(num_heads, key_dim, dtype=torch.float32)
+    k = torch.randn(num_heads, key_dim, dtype=torch.float32)
+    v = torch.randn(num_heads, value_dim, dtype=torch.float32)
+    b = torch.randn(num_heads, key_dim, dtype=torch.float32)
+
+    beta = torch.sigmoid(b)
+    out_ref = torch.zeros(num_heads, value_dim, dtype=torch.float32)
+
+    for h in range(num_heads):
+        for k_idx in range(key_dim):
+            b_val = beta[h, k_idx].item()
+            k_val = k[h, k_idx].item()
+            q_val = q[h, k_idx].item()
+
+            # State update S_t = (1 - beta * k) * S_{t-1} + beta * v
+            state[h, k_idx] = (1.0 - b_val * k_val) * state[h, k_idx] + b_val * v[h]
+            out_ref[h] += state[h, k_idx] * q_val
+
+    print(f"PyTorch GDN Recurrent Step computed. Output Norm: {out_ref.norm().item():.4f}")
+
 if __name__ == "__main__":
     test_matmul_q8()
     test_matmul_q4()
     test_operator_kernels()
     test_rope_kernel()
+    test_gdn_kernel()
