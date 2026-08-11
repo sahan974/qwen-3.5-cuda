@@ -83,6 +83,24 @@ def test_matmul_q4():
         y_ref = torch.mv(W_dequant, x)
         print(f"PyTorch INT4 Reference computed. Target norm: {y_ref.norm().item():.4f}")
 
+def test_operator_kernels():
+    print("\n=== Testing Operator Kernels (RMSNorm, Gated RMSNorm, Residual Add) ===")
+    N = 2048
+    x = torch.randn(N, dtype=torch.float32)
+    weight = torch.randn(N, dtype=torch.float32)
+    gate = torch.randn(N, dtype=torch.float32)
+    eps = 1e-6
+
+    # RMSNorm (1 + weight)
+    rms_ref = x / torch.sqrt(torch.mean(x**2) + eps) * (1.0 + weight)
+    print(f"PyTorch RMSNorm (1+w) Norm: {rms_ref.norm().item():.4f}")
+
+    # Gated RMSNorm
+    silu_gate = gate * torch.sigmoid(gate)
+    gated_rms_ref = (x / torch.sqrt(torch.mean(x**2) + eps)) * weight * silu_gate
+    print(f"PyTorch Gated RMSNorm Norm: {gated_rms_ref.norm().item():.4f}")
+
 if __name__ == "__main__":
     test_matmul_q8()
     test_matmul_q4()
+    test_operator_kernels()
