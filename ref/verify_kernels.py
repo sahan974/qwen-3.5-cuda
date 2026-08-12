@@ -153,9 +153,28 @@ def test_gdn_kernel():
 
     print(f"PyTorch GDN Recurrent Step computed. Output Norm: {out_ref.norm().item():.4f}")
 
+def test_moe_kernels():
+    print("\n=== Testing MoE Top-K Softmax & Expert Accumulation ===")
+    num_experts = 256
+    k = 8
+    d_model = 2048
+
+    logits = torch.randn(num_experts, dtype=torch.float32)
+    topk = torch.topk(logits, k)
+    topk_indices = topk.indices
+    topk_weights = torch.softmax(topk.values, dim=0)
+
+    print(f"Top-8 Expert Indices: {topk_indices.tolist()}")
+    print(f"Top-8 Softmax Weights Sum: {topk_weights.sum().item():.6f}")
+
+    expert_outputs = torch.randn(k, d_model, dtype=torch.float32)
+    accum_ref = torch.sum(expert_outputs * topk_weights.unsqueeze(1), dim=0)
+    print(f"PyTorch MoE Accumulated Output Norm: {accum_ref.norm().item():.4f}")
+
 if __name__ == "__main__":
     test_matmul_q8()
     test_matmul_q4()
     test_operator_kernels()
     test_rope_kernel()
     test_gdn_kernel()
+    test_moe_kernels()

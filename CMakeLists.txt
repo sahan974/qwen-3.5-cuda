@@ -26,6 +26,7 @@ add_executable(qwen-3.5-cuda
     src/cuda/ops.cu
     src/cuda/rope.cu
     src/cuda/gdn.cu
+    src/cuda/moe.cu
 )
 
 target_link_libraries(qwen-3.5-cuda PRIVATE CUDA::cublas CUDA::cudart)
