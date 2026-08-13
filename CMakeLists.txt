@@ -25,6 +25,7 @@ add_executable(qwen-3.5-cuda
     src/layer_attn.cpp
     src/layer_moe.cpp
     src/model.cpp
+    src/tokenizer.cpp
     src/cuda/matmul_q8.cu
     src/cuda/matmul_q4.cu
     src/cuda/ops.cu
