@@ -2,6 +2,7 @@
 #include "config.hpp"
 #include "cuda_utils.hpp"
 #include "loader_gguf.hpp"
+#include "model.hpp"
 
 int main(int argc, char** argv) {
     std::cout << "=== qwen-3.5-cuda: Quantized Qwen 3.5 C++/CUDA Inference Engine ===" << std::endl;
@@ -11,9 +12,6 @@ int main(int argc, char** argv) {
     std::cout << "d_model: " << real_cfg.d_model << std::endl;
     std::cout << "n_layers: " << real_cfg.n_layers << std::endl;
     std::cout << "vocab_size: " << real_cfg.vocab_size << std::endl;
-    std::cout << "GDN Key Dim (derived): " << qwen::cfg_key_dim(real_cfg) << std::endl;
-    std::cout << "GDN Value Dim (derived): " << qwen::cfg_value_dim(real_cfg) << std::endl;
-    std::cout << "GDN Conv Dim (derived): " << qwen::cfg_conv_dim(real_cfg) << std::endl;
 
     qwen::ModelConfig test_cfg = qwen::ModelConfig::test_config();
     std::cout << "\n--- Test Config ---" << std::endl;
@@ -23,8 +21,18 @@ int main(int argc, char** argv) {
     try {
         qwen::CudaContext ctx;
         std::cout << "CudaContext initialized successfully (cublasHandle & cudaStream created)." << std::endl;
+
+        std::cout << "\n--- Testing Full QwenModel Engine Initialization ---" << std::endl;
+        qwen::GgufLoader loader;
+        qwen::QwenModel model;
+        if (model.init(test_cfg, loader)) {
+            std::cout << "Running single decode step test..." << std::endl;
+            int next_tok = model.decode_step(1, 0, ctx);
+            std::cout << "Engine decode step succeeded! Predicted token ID: " << next_tok << std::endl;
+        }
+
     } catch (const std::exception& e) {
-        std::cout << "CudaContext initialization skipped/failed: " << e.what() << std::endl;
+        std::cout << "Engine test skipped/failed: " << e.what() << std::endl;
     }
 
     if (argc > 1) {
