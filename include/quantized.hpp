@@ -29,6 +29,8 @@ enum class GgmlType : uint32_t {
     I8      = 24,
     I16     = 25,
     I32     = 26,
+    F64     = 28,
+    BF16    = 30,
     COUNT
 };
 
@@ -47,6 +49,7 @@ inline uint64_t ggml_type_block_size(GgmlType type) {
     switch (type) {
         case GgmlType::F32:     return 1;
         case GgmlType::F16:     return 1;
+        case GgmlType::BF16:    return 1;
         case GgmlType::Q4_0:    return 32;
         case GgmlType::Q4_1:    return 32;
         case GgmlType::Q5_0:    return 32;
@@ -62,7 +65,7 @@ inline uint64_t ggml_type_block_size(GgmlType type) {
         case GgmlType::I8:      return 1;
         case GgmlType::I16:     return 1;
         case GgmlType::I32:     return 1;
-        default:                return 1;
+        default:                return 0;
     }
 }
 
@@ -71,6 +74,7 @@ inline uint64_t ggml_type_size(GgmlType type) {
     switch (type) {
         case GgmlType::F32:     return 4;
         case GgmlType::F16:     return 2;
+        case GgmlType::BF16:    return 2;
         case GgmlType::Q4_0:    return 18;  // 2 bytes float16 scale + 16 bytes nibbles
         case GgmlType::Q4_1:    return 20;  // 2 bytes scale + 2 bytes min + 16 bytes nibbles
         case GgmlType::Q5_0:    return 22;
@@ -86,13 +90,14 @@ inline uint64_t ggml_type_size(GgmlType type) {
         case GgmlType::I8:      return 1;
         case GgmlType::I16:     return 2;
         case GgmlType::I32:     return 4;
-        default:                return 4;
+        default:                return 0;
     }
 }
 
 inline uint64_t calculate_tensor_bytes(GgmlType type, uint64_t num_elements) {
     uint64_t bs = ggml_type_block_size(type);
     uint64_t ts = ggml_type_size(type);
+    if (bs == 0 || num_elements % bs != 0) return 0;
     return (num_elements / bs) * ts;
 }
 

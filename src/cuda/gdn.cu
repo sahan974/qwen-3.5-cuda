@@ -1,78 +1,42 @@
 #include "gdn.hpp"
+#include "cuda_utils.hpp"
 #include <cmath>
-#include <stdio.h>
-
 namespace qwen {
 
-__device__ __forceinline__ float sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
+__global__ void conv_step_kernel(const float* x,const float* w,float* hist,float* y,int c,int ks){
+    int ch=blockIdx.x*blockDim.x+threadIdx.x;if(ch>=c)return;float sum=0;
+    for(int j=0;j<ks-1;++j)sum+=hist[(size_t)ch*(ks-1)+j]*w[(size_t)ch*ks+j];
+    sum+=x[ch]*w[(size_t)ch*ks+ks-1];
+    for(int j=0;j<ks-2;++j)hist[(size_t)ch*(ks-1)+j]=hist[(size_t)ch*(ks-1)+j+1];
+    hist[(size_t)ch*(ks-1)+ks-2]=x[ch];y[ch]=sum/(1.0f+expf(-sum));
+}
+void gdn_conv_step(const float*x,const float*w,float*h,float*y,int c,int ks,cudaStream_t s){
+    conv_step_kernel<<<(c+255)/256,256,0,s>>>(x,w,h,y,c,ks);CUDA_CHECK(cudaGetLastError());
 }
 
-// Kernel: Each threadblock handles one head (num_heads total grid size)
-__global__ void gdn_recurrent_kernel(
-    float* __restrict__ state,
-    const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
-    const float* __restrict__ b,
-    float* __restrict__ out,
-    int key_dim,
-    int value_dim
-) {
-    int head_idx = blockIdx.x;
-    int v_idx = threadIdx.x; // Handles value_dim elements in parallel
+__global__ void qk_norm_kernel(float*q,float*k,int d,float eps){
+    int h=blockIdx.x;float sq=0,sk=0;for(int i=threadIdx.x;i<d;i+=blockDim.x){float a=q[h*d+i],b=k[h*d+i];sq+=a*a;sk+=b*b;}
+    for(int o=16;o;o>>=1){sq+=__shfl_down_sync(0xffffffff,sq,o);sk+=__shfl_down_sync(0xffffffff,sk,o);}
+    __shared__ float pq[8],pk[8],rq,rk;if((threadIdx.x&31)==0){pq[threadIdx.x>>5]=sq;pk[threadIdx.x>>5]=sk;}__syncthreads();
+    if(threadIdx.x<32){sq=threadIdx.x<blockDim.x/32?pq[threadIdx.x]:0;sk=threadIdx.x<blockDim.x/32?pk[threadIdx.x]:0;
+      for(int o=16;o;o>>=1){sq+=__shfl_down_sync(0xffffffff,sq,o);sk+=__shfl_down_sync(0xffffffff,sk,o);}if(threadIdx.x==0){rq=rsqrtf(sq+eps);rk=rsqrtf(sk+eps);}}
+    __syncthreads();float scale=rsqrtf((float)d);for(int i=threadIdx.x;i<d;i+=blockDim.x){q[h*d+i]*=rq*scale;k[h*d+i]*=rk;}
+}
+void gdn_qk_normalize(float*q,float*k,int h,int d,float e,cudaStream_t s){qk_norm_kernel<<<h,128,0,s>>>(q,k,d,e);CUDA_CHECK(cudaGetLastError());}
 
-    if (v_idx >= value_dim) return;
+__global__ void gates_kernel(const float*b,const float*al,const float*a,const float*dt,float*bo,float*dec,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){bo[i]=1/(1+expf(-b[i]));float x=al[i]+dt[i];float sp=x>20?x:log1pf(expf(x));dec[i]=expf(a[i]*sp);}}
+void gdn_gate_values(const float*b,const float*al,const float*a,const float*dt,float*bo,float*d,int n,cudaStream_t s){gates_kernel<<<(n+255)/256,256,0,s>>>(b,al,a,dt,bo,d,n);CUDA_CHECK(cudaGetLastError());}
 
-    size_t head_state_offset = (size_t)head_idx * key_dim * value_dim;
-    float* head_state = state + head_state_offset;
-
-    const float* head_q = q + head_idx * key_dim;
-    const float* head_k = k + head_idx * key_dim;
-    const float* head_v = v + head_idx * value_dim;
-    const float* head_b = b + head_idx * key_dim;
-
-    float v_t = head_v[v_idx];
-    float out_val = 0.0f;
-
-    // Recurrent update over key_dim dimension
-    for (int k_idx = 0; k_idx < key_dim; ++k_idx) {
-        float beta = sigmoid(head_b[k_idx]);
-        float k_t = head_k[k_idx];
-        float q_t = head_q[k_idx];
-
-        // S_t(k, v) = (1 - beta * k_t) * S_{t-1}(k, v) + beta * v_t
-        size_t state_idx = (size_t)k_idx * value_dim + v_idx;
-        float prev_s = head_state[state_idx];
-        float new_s = (1.0f - beta * k_t) * prev_s + beta * v_t;
-
-        head_state[state_idx] = new_s;
-
-        // Output calculation: out(v) = sum_k (S_t(k, v) * q(k))
-        out_val += new_s * q_t;
-    }
-
-    out[head_idx * value_dim + v_idx] = out_val;
+__global__ void recurrent_kernel(float*S,const float*q,const float*k,const float*v,const float*beta,const float*decay,float*out,int kh,int vh,int dk,int dv){
+    int h=blockIdx.x, j=threadIdx.x;if(j>=dv)return;int source=h/(vh/kh);const float*qh=q+source*dk;const float*khp=k+source*dk;float*Sh=S+(size_t)h*dk*dv;
+    float mem=0;for(int i=0;i<dk;++i){float&cell=Sh[(size_t)i*dv+j];cell*=decay[h];mem+=khp[i]*cell;}
+    float delta=(v[h*dv+j]-mem)*beta[h];for(int i=0;i<dk;++i)Sh[(size_t)i*dv+j]+=khp[i]*delta;
+    float o=0;for(int i=0;i<dk;++i)o+=qh[i]*Sh[(size_t)i*dv+j];out[h*dv+j]=o;
+}
+void gdn_recurrent_step(float*S,const float*q,const float*k,const float*v,const float*b,const float*d,float*out,int kh,int vh,int dk,int dv,cudaStream_t s){
+    if(dv>256)throw std::runtime_error("GDN value dimension exceeds kernel limit");recurrent_kernel<<<vh,256,0,s>>>(S,q,k,v,b,d,out,kh,vh,dk,dv);CUDA_CHECK(cudaGetLastError());
 }
 
-void gdn_recurrent_step(
-    float* state,
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* b,
-    float* out,
-    int num_heads,
-    int key_dim,
-    int value_dim,
-    cudaStream_t stream
-) {
-    int threads = (value_dim < 256) ? value_dim : 256;
-    dim3 grid(num_heads);
-
-    gdn_recurrent_kernel<<<grid, threads, 0, stream>>>(
-        state, q, k, v, b, out, key_dim, value_dim
-    );
+__global__ void norm_gate_kernel(const float*x,const float*z,const float*w,float*out,int d,float eps){int h=blockIdx.x;float ss=0;for(int i=threadIdx.x;i<d;i+=blockDim.x){float a=x[h*d+i];ss+=a*a;}for(int o=16;o;o>>=1)ss+=__shfl_down_sync(0xffffffff,ss,o);__shared__ float part[8],r;if((threadIdx.x&31)==0)part[threadIdx.x>>5]=ss;__syncthreads();if(threadIdx.x<32){ss=threadIdx.x<blockDim.x/32?part[threadIdx.x]:0;for(int o=16;o;o>>=1)ss+=__shfl_down_sync(0xffffffff,ss,o);if(threadIdx.x==0)r=rsqrtf(ss/d+eps);}__syncthreads();for(int i=threadIdx.x;i<d;i+=blockDim.x){float g=z[h*d+i];out[h*d+i]=x[h*d+i]*r*w[i]*(g/(1+expf(-g)));}}
+void gdn_norm_gate(const float*x,const float*z,const float*w,float*out,int h,int d,float e,cudaStream_t s){norm_gate_kernel<<<h,128,0,s>>>(x,z,w,out,d,e);CUDA_CHECK(cudaGetLastError());}
 }
-
-} // namespace qwen

@@ -1,96 +1,18 @@
 #include "layer_moe.hpp"
-#include "moe.hpp"
-#include "ops.hpp"
 #include "matmul_q4.hpp"
-#include <iostream>
-
 namespace qwen {
-
-MoeLayer::~MoeLayer() {
-    free_buffers();
+void moe_topk(const float*,int*,float*,int,int,cudaStream_t);void moe_silu_mul(const float*,const float*,float*,int,cudaStream_t);void moe_add(float*,const float*,float,int,cudaStream_t);void moe_shared_add(float*,const float*,const float*,int,cudaStream_t);
+MoeLayer::~MoeLayer(){free_buffers();}
+void MoeLayer::free_buffers(){for(float**p:{&router_,&gate_,&up_,&hidden_,&expert_out_,&accum_,&sgate_,&shared_gate_,&shared_up_,&shared_hidden_,&shared_out_})if(*p){cudaFree(*p);*p=nullptr;}if(top_idx_){cudaFree(top_idx_);top_idx_=nullptr;}if(top_weight_){cudaFree(top_weight_);top_weight_=nullptr;}if(h_idx_){cudaFreeHost(h_idx_);h_idx_=nullptr;}if(h_weight_){cudaFreeHost(h_weight_);h_weight_=nullptr;}}
+void MoeLayer::init(const ModelConfig&c,int li){free_buffers();cfg_=c;layer_idx_=li;CUDA_CHECK(cudaMalloc(&router_,c.num_experts*sizeof(float)));CUDA_CHECK(cudaMalloc(&top_idx_,c.num_experts_per_tok*sizeof(int)));CUDA_CHECK(cudaMalloc(&top_weight_,c.num_experts_per_tok*sizeof(float)));
+ CUDA_CHECK(cudaMalloc(&gate_,c.moe_intermediate_dim*sizeof(float)));CUDA_CHECK(cudaMalloc(&up_,c.moe_intermediate_dim*sizeof(float)));CUDA_CHECK(cudaMalloc(&hidden_,c.moe_intermediate_dim*sizeof(float)));CUDA_CHECK(cudaMalloc(&expert_out_,c.d_model*sizeof(float)));CUDA_CHECK(cudaMalloc(&accum_,c.d_model*sizeof(float)));
+ CUDA_CHECK(cudaMalloc(&sgate_,sizeof(float)));CUDA_CHECK(cudaMalloc(&shared_gate_,c.shared_expert_dim*sizeof(float)));CUDA_CHECK(cudaMalloc(&shared_up_,c.shared_expert_dim*sizeof(float)));CUDA_CHECK(cudaMalloc(&shared_hidden_,c.shared_expert_dim*sizeof(float)));CUDA_CHECK(cudaMalloc(&shared_out_,c.d_model*sizeof(float)));
+ CUDA_CHECK(cudaHostAlloc(&h_idx_,c.num_experts_per_tok*sizeof(int),cudaHostAllocDefault));CUDA_CHECK(cudaHostAlloc(&h_weight_,c.num_experts_per_tok*sizeof(float),cudaHostAllocDefault));}
+void MoeLayer::forward(const float*x,float*out,const QuantTensor&r,const QuantTensor&eg,const QuantTensor&eu,const QuantTensor&ed,const QuantTensor&sgo,const QuantTensor&sg,const QuantTensor&su,const QuantTensor&sd,const CudaContext&ctx){
+ matmul_dispatch(r,x,router_,cfg_.num_experts,cfg_.d_model,ctx.stream());moe_topk(router_,top_idx_,top_weight_,cfg_.num_experts,cfg_.num_experts_per_tok,ctx.stream());
+ CUDA_CHECK(cudaMemcpyAsync(h_idx_,top_idx_,cfg_.num_experts_per_tok*sizeof(int),cudaMemcpyDeviceToHost,ctx.stream()));CUDA_CHECK(cudaMemcpyAsync(h_weight_,top_weight_,cfg_.num_experts_per_tok*sizeof(float),cudaMemcpyDeviceToHost,ctx.stream()));CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));CUDA_CHECK(cudaMemsetAsync(accum_,0,cfg_.d_model*sizeof(float),ctx.stream()));
+ uint64_t gu_stride=(uint64_t)cfg_.d_model*cfg_.moe_intermediate_dim,down_stride=(uint64_t)cfg_.moe_intermediate_dim*cfg_.d_model;
+ for(int j=0;j<cfg_.num_experts_per_tok;++j){int e=h_idx_[j];matmul_dispatch(eg,x,gate_,cfg_.moe_intermediate_dim,cfg_.d_model,ctx.stream(),e*gu_stride);matmul_dispatch(eu,x,up_,cfg_.moe_intermediate_dim,cfg_.d_model,ctx.stream(),e*gu_stride);moe_silu_mul(gate_,up_,hidden_,cfg_.moe_intermediate_dim,ctx.stream());matmul_dispatch(ed,hidden_,expert_out_,cfg_.d_model,cfg_.moe_intermediate_dim,ctx.stream(),e*down_stride);moe_add(accum_,expert_out_,h_weight_[j],cfg_.d_model,ctx.stream());}
+ matmul_dispatch(sgo,x,sgate_,1,cfg_.d_model,ctx.stream());matmul_dispatch(sg,x,shared_gate_,cfg_.shared_expert_dim,cfg_.d_model,ctx.stream());matmul_dispatch(su,x,shared_up_,cfg_.shared_expert_dim,cfg_.d_model,ctx.stream());moe_silu_mul(shared_gate_,shared_up_,shared_hidden_,cfg_.shared_expert_dim,ctx.stream());matmul_dispatch(sd,shared_hidden_,shared_out_,cfg_.d_model,cfg_.shared_expert_dim,ctx.stream());moe_shared_add(accum_,shared_out_,sgate_,cfg_.d_model,ctx.stream());CUDA_CHECK(cudaMemcpyAsync(out,accum_,cfg_.d_model*sizeof(float),cudaMemcpyDeviceToDevice,ctx.stream()));
 }
-
-void MoeLayer::free_buffers() {
-    if (d_router_logits_) { cudaFree(d_router_logits_); d_router_logits_ = nullptr; }
-    if (d_topk_indices_) { cudaFree(d_topk_indices_); d_topk_indices_ = nullptr; }
-    if (d_topk_weights_) { cudaFree(d_topk_weights_); d_topk_weights_ = nullptr; }
-    if (d_expert_outputs_) { cudaFree(d_expert_outputs_); d_expert_outputs_ = nullptr; }
-    if (d_moe_out_) { cudaFree(d_moe_out_); d_moe_out_ = nullptr; }
-    if (d_shared_out_) { cudaFree(d_shared_out_); d_shared_out_ = nullptr; }
 }
-
-void MoeLayer::init(const ModelConfig& cfg, int layer_idx) {
-    cfg_ = cfg;
-    layer_idx_ = layer_idx;
-    free_buffers();
-
-    CUDA_CHECK(cudaMalloc(&d_router_logits_, cfg_.num_experts * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_topk_indices_, cfg_.num_experts_per_tok * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_topk_weights_, cfg_.num_experts_per_tok * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_expert_outputs_, (size_t)cfg_.num_experts_per_tok * cfg_.d_model * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_moe_out_, cfg_.d_model * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_shared_out_, cfg_.d_model * sizeof(float)));
-}
-
-void MoeLayer::forward(
-    const float* x_in,
-    float* x_out,
-    const QuantTensor& router_w,
-    const QuantTensor& shared_expert_w,
-    const CudaContext& ctx
-) {
-    const float* dummy_scales = x_in;
-    const float* dummy_zeros = x_in;
-
-    // 1. Router GEMM: (2048 -> 256)
-    matmul_w4a16(
-        static_cast<const uint8_t*>(router_w.device_ptr),
-        dummy_scales,
-        dummy_zeros,
-        x_in,
-        d_router_logits_,
-        cfg_.num_experts,
-        cfg_.d_model,
-        32,
-        ctx.stream()
-    );
-
-    // 2. Top-K Softmax selection
-    moe_topk_softmax(
-        d_router_logits_,
-        d_topk_indices_,
-        d_topk_weights_,
-        cfg_.num_experts,
-        cfg_.num_experts_per_tok,
-        ctx.stream()
-    );
-
-    // 3. Accumulate Expert Outputs
-    moe_expert_accumulate(
-        d_expert_outputs_,
-        d_topk_weights_,
-        d_moe_out_,
-        cfg_.num_experts_per_tok,
-        cfg_.d_model,
-        ctx.stream()
-    );
-
-    // 4. Shared Expert Forward GEMM
-    matmul_w4a16(
-        static_cast<const uint8_t*>(shared_expert_w.device_ptr),
-        dummy_scales,
-        dummy_zeros,
-        x_in,
-        d_shared_out_,
-        cfg_.d_model,
-        cfg_.d_model,
-        32,
-        ctx.stream()
-    );
-
-    // 5. Combine Experts + Shared Expert + Residual Add
-    residual_add(d_moe_out_, d_shared_out_, d_moe_out_, cfg_.d_model, ctx.stream());
-    residual_add(x_in, d_moe_out_, x_out, cfg_.d_model, ctx.stream());
-}
-
-} // namespace qwen

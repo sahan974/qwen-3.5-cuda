@@ -1,115 +1,117 @@
 #include "matmul_q4.hpp"
+#include "cuda_utils.hpp"
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <stdio.h>
+#include <stdexcept>
 
 namespace qwen {
+namespace {
 
-__device__ __forceinline__ float warp_reduce_sum_q4(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    }
-    return val;
+__device__ __forceinline__ float fp16_at(const uint8_t* p) {
+    const uint16_t bits = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    return __half2float(*reinterpret_cast<const __half*>(&bits));
 }
 
-// INT4 W4A16 Dequantize-GEMM CUDA Kernel
-__global__ void matmul_w4a16_kernel(
-    const uint8_t* __restrict__ A_packed,
-    const float* __restrict__ scales,
-    const float* __restrict__ zeros,
-    const float* __restrict__ x,
-    float* __restrict__ y,
-    int M,
-    int K,
-    int group_size
-) {
-    int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= M) return;
+__device__ __forceinline__ void scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+    if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+    else { d = (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
 
-    int tid = threadIdx.x;
-    int lane = tid % 32;
-
-    float sum = 0.0f;
-    int num_groups_per_row = K / group_size;
-    const uint8_t* row_A = A_packed + (size_t)row * (K / 2);
-    const float* row_scales = scales + (size_t)row * num_groups_per_row;
-    const float* row_zeros = zeros + (size_t)row * num_groups_per_row;
-
-    // Process elements in pairs (since 1 byte = two 4-bit weights)
-    for (int k_byte = tid; k_byte < K / 2; k_byte += blockDim.x) {
-        int k0 = k_byte * 2;
-        int k1 = k0 + 1;
-
-        uint8_t packed_val = row_A[k_byte];
-        uint8_t w0_u4 = packed_val & 0x0F;
-        uint8_t w1_u4 = (packed_val >> 4) & 0x0F;
-
-        int g0 = k0 / group_size;
-        int g1 = k1 / group_size;
-
-        float s0 = row_scales[g0];
-        float z0 = row_zeros[g0];
-        float s1 = row_scales[g1];
-        float z1 = row_zeros[g1];
-
-        float w0_fp32 = (static_cast<float>(w0_u4) - z0) * s0;
-        float w1_fp32 = (static_cast<float>(w1_u4) - z1) * s1;
-
-        sum += w0_fp32 * x[k0] + w1_fp32 * x[k1];
+__device__ __forceinline__ float dequant(const uint8_t* data, int type, uint64_t index) {
+    if (type == 0) return reinterpret_cast<const float*>(data)[index];
+    if (type == 1) return __half2float(reinterpret_cast<const __half*>(data)[index]);
+    if (type == 30) return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(data)[index]);
+    if (type == 8) {
+        const uint8_t* b = data + (index / 32) * 34; return fp16_at(b) * static_cast<float>(static_cast<int8_t>(b[2 + index % 32]));
     }
-
-    // Warp-level reduction
-    sum = warp_reduce_sum_q4(sum);
-
-    static __shared__ float shared_sums[8][32];
-
-    int warp_id = tid / 32;
-    if (lane == 0) {
-        shared_sums[threadIdx.y][warp_id] = sum;
+    if (type == 2) {
+        const uint8_t* b = data + (index / 32) * 18; int i = index % 32;
+        int q = i < 16 ? (b[2 + i] & 15) : (b[2 + i - 16] >> 4); return fp16_at(b) * (q - 8);
     }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        float block_sum = (tid < (blockDim.x / 32)) ? shared_sums[threadIdx.y][tid] : 0.0f;
-        block_sum = warp_reduce_sum_q4(block_sum);
-        if (tid == 0) {
-            y[row] = block_sum;
+    if (type == 6) {
+        const uint8_t* b = data + (index / 32) * 22; int i = index % 32;
+        uint32_t qh = static_cast<uint32_t>(b[2]) | (static_cast<uint32_t>(b[3]) << 8) |
+                      (static_cast<uint32_t>(b[4]) << 16) | (static_cast<uint32_t>(b[5]) << 24);
+        int j = i & 15; int high = i < 16 ? ((qh >> j) & 1) : ((qh >> (j + 16)) & 1);
+        int low = i < 16 ? (b[6 + j] & 15) : (b[6 + j] >> 4);
+        return fp16_at(b) * ((low | (high << 4)) - 16);
+    }
+    if (type == 12 || type == 13) {
+        const int block_bytes = type == 12 ? 144 : 176;
+        const uint8_t* b = data + (index / 256) * block_bytes; const int i = index % 256;
+        const float d = fp16_at(b), dmin = fp16_at(b + 2); const uint8_t* scales = b + 4;
+        const int sub = i / 32; uint8_t sc, mn; scale_min_k4(sub, scales, sc, mn);
+        const int group64 = i / 64, in64 = i % 64, lane = in64 & 31;
+        if (type == 12) {
+            const uint8_t q = b[16 + group64 * 32 + lane];
+            return d * sc * (in64 < 32 ? (q & 15) : (q >> 4)) - dmin * mn;
         }
+        const uint8_t q = b[48 + group64 * 32 + lane];
+        const uint8_t mask = static_cast<uint8_t>(1u << (2 * group64 + (in64 >= 32)));
+        const int value = (in64 < 32 ? (q & 15) : (q >> 4)) + ((b[16 + lane] & mask) ? 16 : 0);
+        return d * sc * value - dmin * mn;
+    }
+    if (type == 14) {
+        const uint8_t* b = data + (index / 256) * 210; const int i = index % 256;
+        const uint8_t* ql = b; const uint8_t* qh = b + 128; const int8_t* scales = reinterpret_cast<const int8_t*>(b + 192);
+        const int half = i / 128, r = i % 128, lane = r & 31, quarter = r / 32;
+        const uint8_t lo = quarter == 0 ? (ql[half * 64 + lane] & 15) :
+                           quarter == 1 ? (ql[half * 64 + 32 + lane] & 15) :
+                           quarter == 2 ? (ql[half * 64 + lane] >> 4) : (ql[half * 64 + 32 + lane] >> 4);
+        const uint8_t hi = (qh[half * 32 + lane] >> (2 * quarter)) & 3;
+        const int scale_index = half * 8 + (lane / 16) + 2 * quarter;
+        return fp16_at(b + 208) * scales[scale_index] * (static_cast<int>(lo | (hi << 4)) - 32);
+    }
+    return 0.0f;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int off = 16; off; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off); return v;
+}
+
+__global__ void gemv_kernel(const uint8_t* w, int type, const float* x, float* y,
+                            int M, int K, uint64_t element_offset) {
+    int row = blockIdx.x; if (row >= M) return;
+    float sum = 0.0f; uint64_t base = element_offset + static_cast<uint64_t>(row) * K;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) sum += dequant(w, type, base + k) * x[k];
+    sum = warp_sum(sum);
+    __shared__ float partial[8];
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        sum = threadIdx.x < blockDim.x / 32 ? partial[threadIdx.x] : 0.0f; sum = warp_sum(sum);
+        if (threadIdx.x == 0) y[row] = sum;
     }
 }
 
-void matmul_w4a16(
-    const uint8_t* A_packed_ptr,
-    const float* scales_ptr,
-    const float* zeros_ptr,
-    const float* x_ptr,
-    float* y_ptr,
-    int M,
-    int K,
-    int group_size,
-    cudaStream_t stream
-) {
-    dim3 block(32, 4);
-    dim3 grid((M + block.y - 1) / block.y);
+__global__ void row_kernel(const uint8_t* w, int type, float* out, uint64_t start, int cols) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < cols; i += blockDim.x * gridDim.x)
+        out[i] = dequant(w, type, start + i);
+}
 
-    matmul_w4a16_kernel<<<grid, block, 0, stream>>>(
-        A_packed_ptr, scales_ptr, zeros_ptr, x_ptr, y_ptr, M, K, group_size
-    );
+} // namespace
+
+bool matmul_type_supported(GgmlType t) {
+    return t == GgmlType::F32 || t == GgmlType::F16 || t == GgmlType::BF16 || t == GgmlType::Q4_0 ||
+           t == GgmlType::Q5_0 || t == GgmlType::Q8_0 || t == GgmlType::Q4_K || t == GgmlType::Q5_K || t == GgmlType::Q6_K;
+}
+
+void matmul_dispatch(const QuantTensor& w, const float* x, float* y, int M, int K,
+                     cudaStream_t stream, uint64_t element_offset) {
+    if (!w.device_ptr) throw std::runtime_error("tensor '" + w.name + "' is not loaded");
+    if (!matmul_type_supported(w.type)) throw std::runtime_error("unsupported GGML type for tensor '" + w.name + "'");
+    if (M <= 0 || K <= 0 || element_offset + static_cast<uint64_t>(M) * K > w.num_elements)
+        throw std::runtime_error("GEMV shape exceeds tensor '" + w.name + "'");
+    gemv_kernel<<<M, 256, 0, stream>>>(static_cast<const uint8_t*>(w.device_ptr), static_cast<int>(w.type), x, y, M, K, element_offset);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void dequantize_row(const QuantTensor& t, float* out, int row, int cols, cudaStream_t stream) {
+    if (!t.device_ptr || !matmul_type_supported(t.type)) throw std::runtime_error("cannot dequantize tensor '" + t.name + "'");
+    uint64_t start = static_cast<uint64_t>(row) * cols;
+    if (row < 0 || cols <= 0 || start + cols > t.num_elements) throw std::runtime_error("row is outside tensor '" + t.name + "'");
+    row_kernel<<<(cols + 255) / 256, 256, 0, stream>>>(static_cast<const uint8_t*>(t.device_ptr), static_cast<int>(t.type), out, start, cols);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace qwen
-
-extern "C" {
-    void run_matmul_w4a16(
-        const uint8_t* A_packed,
-        const float* scales,
-        const float* zeros,
-        const float* x,
-        float* y,
-        int M,
-        int K,
-        int group_size
-    ) {
-        qwen::matmul_w4a16(A_packed, scales, zeros, x, y, M, K, group_size, nullptr);
-        cudaDeviceSynchronize();
-    }
-}

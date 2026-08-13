@@ -1,31 +1,16 @@
 #ifndef QWEN_GDN_HPP
 #define QWEN_GDN_HPP
-
 #include <cuda_runtime.h>
-#include <cstdint>
-
 namespace qwen {
-
-// Gated DeltaNet Recurrent Update Kernel
-// state: (num_heads, key_dim, value_dim) persistent state tensor
-// q: (num_heads, key_dim)
-// k: (num_heads, key_dim)
-// v: (num_heads, value_dim)
-// b: (num_heads, key_dim) beta gate values
-// out: (num_heads, value_dim) output activation
-void gdn_recurrent_step(
-    float* state,
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* b,
-    float* out,
-    int num_heads,
-    int key_dim,
-    int value_dim,
-    cudaStream_t stream = nullptr
-);
-
-} // namespace qwen
-
-#endif // QWEN_GDN_HPP
+void gdn_conv_step(const float* input, const float* weight, float* history, float* output,
+                   int channels, int kernel, cudaStream_t stream);
+void gdn_qk_normalize(float* q, float* k, int heads, int dim, float eps, cudaStream_t stream);
+void gdn_gate_values(const float* beta_raw, const float* alpha_raw, const float* a,
+                     const float* dt_bias, float* beta, float* decay, int heads, cudaStream_t stream);
+void gdn_recurrent_step(float* state, const float* q, const float* k, const float* v,
+                        const float* beta, const float* decay, float* out,
+                        int key_heads, int value_heads, int key_dim, int value_dim, cudaStream_t stream);
+void gdn_norm_gate(const float* x, const float* z, const float* weight, float* out,
+                   int heads, int dim, float eps, cudaStream_t stream);
+}
+#endif

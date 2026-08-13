@@ -1,4 +1,5 @@
 #include "loader_gguf.hpp"
+#include <cuda_runtime.h>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -13,17 +14,35 @@ GgufLoader::~GgufLoader() {
 }
 
 void GgufLoader::close() {
+    unload_gpu();
     tensors_.clear();
     metadata_str_.clear();
+    metadata_arrays_.clear();
 }
 
 std::string GgufLoader::read_string(std::ifstream& fin) {
     uint64_t len = 0;
     fin.read(reinterpret_cast<char*>(&len), sizeof(len));
-    if (!fin.good()) return "";
+    if (!fin.good()) throw std::runtime_error("truncated GGUF string length");
+    if (len > (1ULL << 32)) throw std::runtime_error("unreasonable GGUF string length");
     std::string str(len, '\0');
     fin.read(&str[0], len);
+    if (!fin.good()) throw std::runtime_error("truncated GGUF string");
     return str;
+}
+
+std::vector<std::string> GgufLoader::read_metadata_array(std::ifstream& fin) {
+    uint32_t raw_type = 0;
+    uint64_t count = 0;
+    fin.read(reinterpret_cast<char*>(&raw_type), sizeof(raw_type));
+    fin.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!fin.good() || count > (1ULL << 32)) throw std::runtime_error("invalid GGUF metadata array");
+    const auto type = static_cast<GgufMetadataValueType>(raw_type);
+    if (type == GgufMetadataValueType::ARRAY) throw std::runtime_error("nested GGUF arrays are unsupported");
+    std::vector<std::string> result;
+    result.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) result.push_back(read_metadata_value_as_string(fin, type));
+    return result;
 }
 
 void GgufLoader::skip_metadata_value(std::ifstream& fin, GgufMetadataValueType vtype) {
@@ -76,18 +95,7 @@ std::string GgufLoader::read_metadata_value_as_string(std::ifstream& fin, GgufMe
         case GgufMetadataValueType::FLOAT64: { double v; fin.read(reinterpret_cast<char*>(&v), 8); return std::to_string(v); }
         case GgufMetadataValueType::STRING: return read_string(fin);
         case GgufMetadataValueType::ARRAY: {
-            uint32_t raw_arr_type = 0;
-            uint64_t arr_len = 0;
-            fin.read(reinterpret_cast<char*>(&raw_arr_type), sizeof(raw_arr_type));
-            fin.read(reinterpret_cast<char*>(&arr_len), sizeof(arr_len));
-            GgufMetadataValueType arr_type = static_cast<GgufMetadataValueType>(raw_arr_type);
-            std::string res = "[";
-            for (uint64_t i = 0; i < arr_len; ++i) {
-                if (i > 0) res += ", ";
-                res += read_metadata_value_as_string(fin, arr_type);
-            }
-            res += "]";
-            return res;
+            throw std::runtime_error("array metadata must be read with read_metadata_array");
         }
         default:
             skip_metadata_value(fin, vtype);
@@ -96,6 +104,7 @@ std::string GgufLoader::read_metadata_value_as_string(std::ifstream& fin, GgufMe
 }
 
 bool GgufLoader::open(const std::string& filepath) {
+    close();
     filepath_ = filepath;
     std::ifstream fin(filepath, std::ios::binary);
     if (!fin.is_open()) {
@@ -120,8 +129,8 @@ bool GgufLoader::open(const std::string& filepath) {
         uint32_t raw_vtype = 0;
         fin.read(reinterpret_cast<char*>(&raw_vtype), sizeof(raw_vtype));
         GgufMetadataValueType vtype = static_cast<GgufMetadataValueType>(raw_vtype);
-        std::string val_str = read_metadata_value_as_string(fin, vtype);
-        metadata_str_[key] = val_str;
+        if (vtype == GgufMetadataValueType::ARRAY) metadata_arrays_[key] = read_metadata_array(fin);
+        else metadata_str_[key] = read_metadata_value_as_string(fin, vtype);
     }
 
     // Parse tensor info headers
@@ -147,13 +156,18 @@ bool GgufLoader::open(const std::string& filepath) {
         fin.read(reinterpret_cast<char*>(&tensor.offset), sizeof(tensor.offset));
 
         tensor.size_bytes = calculate_tensor_bytes(tensor.type, tensor.num_elements);
+        if (tensor.size_bytes == 0) {
+            throw std::runtime_error("unsupported or malformed tensor '" + tensor.name + "' (GGML type " +
+                                     std::to_string(raw_type) + ")");
+        }
 
         tensors_.push_back(tensor);
     }
 
-    // Align to 32 bytes for binary payload start
+    const uint64_t alignment = static_cast<uint64_t>(get_meta_int("general.alignment", 32));
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) throw std::runtime_error("invalid GGUF alignment");
     uint64_t cur_pos = fin.tellg();
-    payload_offset_ = (cur_pos + 31) & ~31;
+    payload_offset_ = (cur_pos + alignment - 1) & ~(alignment - 1);
 
     return true;
 }
@@ -220,17 +234,19 @@ bool GgufLoader::load_tensors_to_gpu() {
 
 void GgufLoader::print_summary() const {
     std::cout << "--- GGUF Header Summary ---" << std::endl;
-    std::cout << "File: " << filepath_ << std::endl;
-    std::cout << "GGUF Version: " << version_ << std::endl;
-    std::cout << "Tensor Count: " << tensor_count_ << std::endl;
+    std::cout << "File: "             << filepath_       << std::endl;
+    std::cout << "GGUF Version: "    << version_        << std::endl;
+    std::cout << "Tensor Count: "    << tensor_count_   << std::endl;
     std::cout << "Metadata KV Count: " << metadata_count_ << std::endl;
-    
-    std::cout << "\nKey Metadata Entries:" << std::endl;
-    for (const auto& [k, v] : metadata_str_) {
-        if (k.find("architecture") != std::string::npos ||
-            k.find("context_length") != std::string::npos ||
-            k.find("embedding_length") != std::string::npos ||
-            k.find("block_count") != std::string::npos) {
+
+    std::cout << "\nAll Metadata Entries:" << std::endl;
+    for (const auto& item : metadata_str_) {
+        const std::string& k = item.first;
+        const std::string& v = item.second;
+        // Skip huge array values (tokenizer vocab etc.)
+        if (v.size() > 120) {
+            std::cout << "  " << k << " = [... " << v.size() << " chars ...]" << std::endl;
+        } else {
             std::cout << "  " << k << " = " << v << std::endl;
         }
     }

@@ -1,116 +1,28 @@
 #include "model.hpp"
-#include "ops.hpp"
 #include "matmul_q4.hpp"
-#include <iostream>
+#include "ops.hpp"
 #include <algorithm>
-
+#include <cmath>
+#include <stdexcept>
 namespace qwen {
-
-QwenModel::~QwenModel() {
-    free_buffers();
+namespace {
+const QuantTensor& require(const GgufLoader&l,const std::string&name,std::initializer_list<int64_t> shape={}){auto*t=l.get_tensor(name);if(!t)throw std::runtime_error("required tensor missing: "+name);if(!t->device_ptr)throw std::runtime_error("required tensor not loaded: "+name);if(!shape.size())return*t;if(t->shape.size()!=shape.size()||!std::equal(shape.begin(),shape.end(),t->shape.begin()))throw std::runtime_error("wrong shape for tensor "+name);return*t;}
+const QuantTensor& require_any(const GgufLoader&l,const std::vector<std::string>&names,std::initializer_list<int64_t> shape){for(const auto&n:names)if(l.get_tensor(n))return require(l,n,shape);throw std::runtime_error("required tensor missing: "+names.front());}
+const float* f32(const QuantTensor&t){if(t.type!=GgmlType::F32)throw std::runtime_error("tensor must be F32: "+t.name);return static_cast<const float*>(t.device_ptr);}
 }
-
-void QwenModel::free_buffers() {
-    if (d_x_) { cudaFree(d_x_); d_x_ = nullptr; }
-    if (d_x_next_) { cudaFree(d_x_next_); d_x_next_ = nullptr; }
-    if (d_logits_) { cudaFree(d_logits_); d_logits_ = nullptr; }
-    if (h_logits_) { cudaFreeHost(h_logits_); h_logits_ = nullptr; }
-
-    gdn_layers_.clear();
-    attn_layers_.clear();
-    moe_layers_.clear();
+QwenModel::~QwenModel(){free_buffers();}
+void QwenModel::free_buffers(){for(float**p:{&x_,&resid_,&normed_,&branch_,&moe_out_,&logits_})if(*p){cudaFree(*p);*p=nullptr;}if(host_logits_){cudaFreeHost(host_logits_);host_logits_=nullptr;}gdn_.clear();attn_.clear();moe_.clear();w_.clear();next_pos_=0;}
+bool QwenModel::init(const ModelConfig&c,const GgufLoader&l){free_buffers();cfg_=c;cfg_.validate();loader_=&l;
+ embedding_=&require(l,"token_embd.weight",{cfg_.d_model,cfg_.vocab_size});final_norm_=&require(l,"output_norm.weight",{cfg_.d_model});head_=&require(l,"output.weight",{cfg_.d_model,cfg_.vocab_size});
+ w_.resize(cfg_.n_layers);gdn_.resize(cfg_.n_layers);attn_.resize(cfg_.n_layers);moe_.resize(cfg_.n_layers);
+ for(int i=0;i<cfg_.n_layers;++i){auto p="blk."+std::to_string(i)+".";auto&z=w_[i];z.norm=&require(l,p+"attn_norm.weight",{cfg_.d_model});z.post_norm=&require_any(l,{p+"post_attention_norm.weight",p+"attn_post_norm.weight"},{cfg_.d_model});
+  if(cfg_is_full_attn(cfg_,i)){int qd=cfg_.num_heads*cfg_.head_dim,kd=cfg_.num_kv_heads*cfg_.head_dim;z.q=&require(l,p+"attn_q.weight",{cfg_.d_model,2*qd});z.k=&require(l,p+"attn_k.weight",{cfg_.d_model,kd});z.v=&require(l,p+"attn_v.weight",{cfg_.d_model,kd});z.o=&require(l,p+"attn_output.weight",{qd,cfg_.d_model});z.qn=&require(l,p+"attn_q_norm.weight",{cfg_.head_dim});z.kn=&require(l,p+"attn_k_norm.weight",{cfg_.head_dim});attn_[i]=std::make_unique<AttnLayer>();attn_[i]->init(cfg_,i);
+  }else{int cd=cfg_conv_dim(cfg_),vd=cfg_value_dim(cfg_),vh=cfg_.gdn_num_v_heads;z.qkv=&require(l,p+"attn_qkv.weight",{cfg_.d_model,cd});z.z=&require(l,p+"attn_gate.weight",{cfg_.d_model,vd});z.beta=&require(l,p+"ssm_beta.weight",{cfg_.d_model,vh});z.alpha=&require(l,p+"ssm_alpha.weight",{cfg_.d_model,vh});z.conv=&require(l,p+"ssm_conv1d.weight",{cfg_.conv_kernel_size,cd});z.a=&require(l,p+"ssm_a",{vh});z.dt=&require(l,p+"ssm_dt.bias",{vh});z.gdn_norm=&require(l,p+"ssm_norm.weight",{cfg_.gdn_value_dim});z.gdn_out=&require(l,p+"ssm_out.weight",{vd,cfg_.d_model});gdn_[i]=std::make_unique<GdnLayer>();gdn_[i]->init(cfg_,i);}
+  z.router=&require(l,p+"ffn_gate_inp.weight",{cfg_.d_model,cfg_.num_experts});z.eg=&require(l,p+"ffn_gate_exps.weight",{cfg_.d_model,cfg_.moe_intermediate_dim,cfg_.num_experts});z.eu=&require(l,p+"ffn_up_exps.weight",{cfg_.d_model,cfg_.moe_intermediate_dim,cfg_.num_experts});z.ed=&require(l,p+"ffn_down_exps.weight",{cfg_.moe_intermediate_dim,cfg_.d_model,cfg_.num_experts});z.sgate=&require(l,p+"ffn_gate_inp_shexp.weight",{cfg_.d_model});z.sg=&require(l,p+"ffn_gate_shexp.weight",{cfg_.d_model,cfg_.shared_expert_dim});z.su=&require(l,p+"ffn_up_shexp.weight",{cfg_.d_model,cfg_.shared_expert_dim});z.sd=&require(l,p+"ffn_down_shexp.weight",{cfg_.shared_expert_dim,cfg_.d_model});moe_[i]=std::make_unique<MoeLayer>();moe_[i]->init(cfg_,i);
+  f32(*z.norm);f32(*z.post_norm);if(z.qn){f32(*z.qn);f32(*z.kn);}if(z.conv){f32(*z.conv);f32(*z.a);f32(*z.dt);f32(*z.gdn_norm);}
+ }
+ for(float**p:{&x_,&resid_,&normed_,&branch_,&moe_out_})CUDA_CHECK(cudaMalloc(p,cfg_.d_model*sizeof(float)));CUDA_CHECK(cudaMalloc(&logits_,cfg_.vocab_size*sizeof(float)));CUDA_CHECK(cudaHostAlloc(&host_logits_,cfg_.vocab_size*sizeof(float),cudaHostAllocDefault));return true;}
+int QwenModel::decode_step(int token,int pos,const CudaContext&ctx){if(pos!=next_pos_)throw std::runtime_error("decode positions must be contiguous from zero");if(token<0||token>=cfg_.vocab_size)throw std::runtime_error("input token is outside model vocabulary");dequantize_row(*embedding_,x_,token,cfg_.d_model,ctx.stream());
+ for(int i=0;i<cfg_.n_layers;++i){auto&z=w_[i];rmsnorm_forward(x_,f32(*z.norm),normed_,cfg_.d_model,cfg_.rms_eps,ctx.stream());if(attn_[i])attn_[i]->forward(normed_,branch_,pos,*z.q,*z.k,*z.v,*z.o,f32(*z.qn),f32(*z.kn),ctx);else gdn_[i]->forward(normed_,branch_,*z.qkv,*z.z,*z.beta,*z.alpha,*z.gdn_out,f32(*z.conv),f32(*z.a),f32(*z.dt),f32(*z.gdn_norm),ctx);residual_add(x_,branch_,resid_,cfg_.d_model,ctx.stream());rmsnorm_forward(resid_,f32(*z.post_norm),normed_,cfg_.d_model,cfg_.rms_eps,ctx.stream());moe_[i]->forward(normed_,moe_out_,*z.router,*z.eg,*z.eu,*z.ed,*z.sgate,*z.sg,*z.su,*z.sd,ctx);residual_add(resid_,moe_out_,x_,cfg_.d_model,ctx.stream());}
+ rmsnorm_forward(x_,f32(*final_norm_),normed_,cfg_.d_model,cfg_.rms_eps,ctx.stream());matmul_dispatch(*head_,normed_,logits_,cfg_.vocab_size,cfg_.d_model,ctx.stream());CUDA_CHECK(cudaMemcpyAsync(host_logits_,logits_,cfg_.vocab_size*sizeof(float),cudaMemcpyDeviceToHost,ctx.stream()));CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));int best=0;float bv=host_logits_[0];if(!std::isfinite(bv))throw std::runtime_error("non-finite LM-head logits");for(int i=1;i<cfg_.vocab_size;++i){if(!std::isfinite(host_logits_[i]))throw std::runtime_error("non-finite LM-head logits");if(host_logits_[i]>bv){bv=host_logits_[i];best=i;}}++next_pos_;return best;}
 }
-
-bool QwenModel::init(const ModelConfig& cfg, const GgufLoader& loader) {
-    cfg_ = cfg;
-    free_buffers();
-
-    CUDA_CHECK(cudaMalloc(&d_x_, cfg_.d_model * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_x_next_, cfg_.d_model * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_logits_, cfg_.vocab_size * sizeof(float)));
-    CUDA_CHECK(cudaHostAlloc(&h_logits_, cfg_.vocab_size * sizeof(float), cudaHostAllocDefault));
-
-    // Initialize 40 decoder layers
-    for (int i = 0; i < cfg_.n_layers; ++i) {
-        if (cfg_is_full_attn(i)) {
-            auto attn = std::make_unique<AttnLayer>();
-            attn->init(cfg_, i);
-            attn_layers_.push_back(std::move(attn));
-        } else {
-            auto gdn = std::make_unique<GdnLayer>();
-            gdn->init(cfg_, i);
-            gdn_layers_.push_back(std::move(gdn));
-        }
-
-        auto moe = std::make_unique<MoeLayer>();
-        moe->init(cfg_, i);
-        moe_layers_.push_back(std::move(moe));
-    }
-
-    std::cout << "QwenModel initialized with " << cfg_.n_layers << " layers successfully." << std::endl;
-    return true;
-}
-
-int QwenModel::decode_step(int token_id, int pos, const CudaContext& ctx) {
-    // 1. Embedding lookup (dummy zeros for demo)
-    CUDA_CHECK(cudaMemsetAsync(d_x_, 0, cfg_.d_model * sizeof(float), ctx.stream()));
-
-    // Dummy empty QuantTensor for testing layer connections
-    QuantTensor dummy_w;
-    dummy_w.device_ptr = d_x_;
-
-    int gdn_idx = 0;
-    int attn_idx = 0;
-
-    // 2. Pass through 40 decoder layers
-    for (int i = 0; i < cfg_.n_layers; ++i) {
-        if (cfg_is_full_attn(i)) {
-            attn_layers_[attn_idx]->forward(d_x_, d_x_next_, pos, dummy_w, dummy_w, dummy_w, dummy_w, d_x_, d_x_, ctx);
-            attn_idx++;
-        } else {
-            gdn_layers_[gdn_idx]->forward(d_x_, d_x_next_, dummy_w, dummy_w, d_x_, ctx);
-            gdn_idx++;
-        }
-
-        // Swap activation pointers
-        std::swap(d_x_, d_x_next_);
-
-        // MoE block
-        moe_layers_[i]->forward(d_x_, d_x_next_, dummy_w, dummy_w, ctx);
-        std::swap(d_x_, d_x_next_);
-    }
-
-    // 3. Final RMSNorm
-    rmsnorm_forward(d_x_, d_x_, d_x_next_, cfg_.d_model, 1e-6f, ctx.stream());
-
-    // 4. LM Head Logits GEMM
-    matmul_w4a16(
-        static_cast<const uint8_t*>(dummy_w.device_ptr),
-        d_x_,
-        d_x_,
-        d_x_next_,
-        d_logits_,
-        cfg_.vocab_size,
-        cfg_.d_model,
-        32,
-        ctx.stream()
-    );
-
-    // 5. Copy logits to host pinned memory for greedy sampling
-    CUDA_CHECK(cudaMemcpyAsync(h_logits_, d_logits_, cfg_.vocab_size * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
-    ctx.synchronize();
-
-    // Argmax selection
-    int next_token = 0;
-    float max_logit = h_logits_[0];
-    for (int v = 1; v < cfg_.vocab_size; ++v) {
-        if (h_logits_[v] > max_logit) {
-            max_logit = h_logits_[v];
-            next_token = v;
-        }
-    }
-
-    return next_token;
-}
-
-} // namespace qwen

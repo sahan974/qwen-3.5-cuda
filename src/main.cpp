@@ -1,54 +1,21 @@
-#include <iostream>
 #include "config.hpp"
 #include "cuda_utils.hpp"
 #include "loader_gguf.hpp"
 #include "model.hpp"
-
-int main(int argc, char** argv) {
-    std::cout << "=== qwen-3.5-cuda: Quantized Qwen 3.5 C++/CUDA Inference Engine ===" << std::endl;
-    
-    qwen::ModelConfig real_cfg = qwen::ModelConfig::real_config();
-    std::cout << "\n--- Real Qwen3.5-35B-A3B Config ---" << std::endl;
-    std::cout << "d_model: " << real_cfg.d_model << std::endl;
-    std::cout << "n_layers: " << real_cfg.n_layers << std::endl;
-    std::cout << "vocab_size: " << real_cfg.vocab_size << std::endl;
-
-    qwen::ModelConfig test_cfg = qwen::ModelConfig::test_config();
-    std::cout << "\n--- Test Config ---" << std::endl;
-    std::cout << "d_model: " << test_cfg.d_model << ", n_layers: " << test_cfg.n_layers << std::endl;
-
-    std::cout << "\n--- Testing CUDA Utils & CudaContext ---" << std::endl;
-    try {
-        qwen::CudaContext ctx;
-        std::cout << "CudaContext initialized successfully (cublasHandle & cudaStream created)." << std::endl;
-
-        std::cout << "\n--- Testing Full QwenModel Engine Initialization ---" << std::endl;
-        qwen::GgufLoader loader;
-        qwen::QwenModel model;
-        if (model.init(test_cfg, loader)) {
-            std::cout << "Running single decode step test..." << std::endl;
-            int next_tok = model.decode_step(1, 0, ctx);
-            std::cout << "Engine decode step succeeded! Predicted token ID: " << next_tok << std::endl;
-        }
-
-    } catch (const std::exception& e) {
-        std::cout << "Engine test skipped/failed: " << e.what() << std::endl;
-    }
-
-    if (argc > 1) {
-        std::cout << "\n--- Testing GGUF Tensor Loading to GPU ---" << std::endl;
-        std::string gguf_path = argv[1];
-        qwen::GgufLoader loader;
-        if (loader.open(gguf_path)) {
-            loader.print_summary();
-            std::cout << "\nInitiating GPU transfer..." << std::endl;
-            if (loader.load_tensors_to_gpu()) {
-                std::cout << "All tensors safely residing in GPU VRAM!" << std::endl;
-                loader.unload_gpu();
-                std::cout << "VRAM freed successfully." << std::endl;
-            }
-        }
-    }
-
-    return 0;
+#include "tokenizer.hpp"
+#include <chrono>
+#include <iostream>
+#include <stdexcept>
+using qwen::QuantTensor;
+namespace {
+const QuantTensor& tensor(const qwen::GgufLoader&l,const std::string&n){auto*t=l.get_tensor(n);if(!t)throw std::runtime_error("cannot derive config; missing "+n);return*t;}
+qwen::ModelConfig config_from(const qwen::GgufLoader&l,int ctx){qwen::ModelConfig c=qwen::ModelConfig::real_config();const auto&emb=tensor(l,"token_embd.weight");if(emb.shape.size()!=2)throw std::runtime_error("token embedding must be 2-D");c.d_model=emb.shape[0];c.vocab_size=emb.shape[1];c.n_layers=l.get_meta_int("qwen35moe.block_count",40);c.max_seq_len=ctx;c.rms_eps=l.get_meta_float("qwen35moe.attention.layer_norm_rms_epsilon",1e-6);c.full_attn_interval=l.get_meta_int("qwen35moe.full_attention_interval",4);c.rope_theta=l.get_meta_float("qwen35moe.rope.freq_base",10000000.0);
+ const auto&qkv=tensor(l,"blk.0.attn_qkv.weight"),&z=tensor(l,"blk.0.attn_gate.weight"),&conv=tensor(l,"blk.0.ssm_conv1d.weight"),&alpha=tensor(l,"blk.0.ssm_alpha.weight"),&gn=tensor(l,"blk.0.ssm_norm.weight");if(qkv.shape.size()!=2||z.shape.size()!=2||conv.shape.size()!=2||alpha.shape.size()!=2)throw std::runtime_error("malformed GDN tensors");c.conv_kernel_size=conv.shape[0];c.gdn_num_v_heads=alpha.shape[1];c.gdn_value_dim=gn.shape[0];c.gdn_num_k_heads=l.get_meta_int("qwen35moe.ssm.group_count",16);int key_total=(qkv.shape[1]-z.shape[1])/2;if(key_total<=0||key_total%c.gdn_num_k_heads)throw std::runtime_error("cannot derive GDN key dimensions");c.gdn_key_dim=key_total/c.gdn_num_k_heads;
+ int ai=c.full_attn_interval-1;std::string p="blk."+std::to_string(ai)+".";const auto&aq=tensor(l,p+"attn_q.weight"),&ak=tensor(l,p+"attn_k.weight"),&qn=tensor(l,p+"attn_q_norm.weight");c.head_dim=qn.shape.at(0);c.num_heads=aq.shape.at(1)/(2*c.head_dim);c.num_kv_heads=ak.shape.at(1)/c.head_dim;c.partial_rope_dim=64;if(auto*a=l.get_meta_array("qwen35moe.rope.dimension_sections")){int sum=0;for(const auto&s:*a)sum+=std::stoi(s);if(sum>0)c.partial_rope_dim=2*sum;}
+ const auto&eg=tensor(l,"blk.0.ffn_gate_exps.weight"),&sg=tensor(l,"blk.0.ffn_gate_shexp.weight");c.moe_intermediate_dim=eg.shape.at(1);c.num_experts=eg.shape.at(2);c.num_experts_per_tok=l.get_meta_int("qwen35moe.expert_used_count",8);c.shared_expert_dim=sg.shape.at(1);c.validate();return c;}
+void usage(const char*p){std::cout<<"Usage: "<<p<<" --weights MODEL.gguf [--prompt TEXT] [--max N] [--ctx N] [--tokenize-only]\n";}
 }
+int main(int argc,char**argv){std::string path,prompt="The capital of France is";int max_tokens=64,ctx_len=4096;bool tokenize_only=false;try{for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--weights"&&i+1<argc)path=argv[++i];else if(a=="--prompt"&&i+1<argc)prompt=argv[++i];else if(a=="--max"&&i+1<argc)max_tokens=std::stoi(argv[++i]);else if(a=="--ctx"&&i+1<argc)ctx_len=std::stoi(argv[++i]);else if(a=="--tokenize-only")tokenize_only=true;else if(a=="--stream"){}else if(a=="--help"){usage(argv[0]);return 0;}else throw std::runtime_error("unknown or incomplete argument: "+a);}if(path.empty())throw std::runtime_error("--weights is required; there is no fake dry-run mode");if(prompt.empty())throw std::runtime_error("prompt must not be empty");if(max_tokens<0||ctx_len<=0)throw std::runtime_error("invalid token/context limit");
+ qwen::GgufLoader loader;if(!loader.open(path))return 1;qwen::ModelConfig cfg=config_from(loader,ctx_len);qwen::BPETokenizer tok;tok.init(loader);if(tok.vocab_size()!=cfg.vocab_size)throw std::runtime_error("tokenizer vocabulary and embedding vocabulary differ");auto ids=tok.encode(prompt,false);if(ids.empty())throw std::runtime_error("prompt encoded to zero tokens");if(tokenize_only){std::cout<<"TOKEN_IDS:";for(int id:ids)std::cout<<" "<<id;std::cout<<std::endl;return 0;}if(!loader.load_tensors_to_gpu())throw std::runtime_error("failed to load every GGUF tensor to the GPU");qwen::CudaContext cuda;qwen::QwenModel model;model.init(cfg,loader);if((int)ids.size()+max_tokens>ctx_len)throw std::runtime_error("prompt plus generation exceeds --ctx");
+ std::cout<<prompt<<std::flush;int pos=0,next=-1;for(int id:ids)next=model.decode_step(id,pos++,cuda);auto start=std::chrono::steady_clock::now();int generated=0;while(generated<max_tokens&&!tok.is_eog(next)){std::cout<<tok.decode(next)<<std::flush;++generated;if(generated==max_tokens)break;next=model.decode_step(next,pos++,cuda);}double sec=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();std::cout<<"\n\nGenerated "<<generated<<" tokens in "<<sec<<" s";if(sec>0)std::cout<<" ("<<generated/sec<<" tok/s)";std::cout<<std::endl;return 0;
+ }catch(const std::exception&e){std::cerr<<"Fatal: "<<e.what()<<std::endl;return 1;}}
