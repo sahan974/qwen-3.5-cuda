@@ -2,6 +2,7 @@
 #define QWEN_QUANTIZED_HPP
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -98,7 +99,9 @@ inline uint64_t calculate_tensor_bytes(GgmlType type, uint64_t num_elements) {
     uint64_t bs = ggml_type_block_size(type);
     uint64_t ts = ggml_type_size(type);
     if (bs == 0 || num_elements % bs != 0) return 0;
-    return (num_elements / bs) * ts;
+    const uint64_t blocks = num_elements / bs;
+    if (ts == 0 || blocks > std::numeric_limits<uint64_t>::max() / ts) return 0;
+    return blocks * ts;
 }
 
 } // namespace qwen

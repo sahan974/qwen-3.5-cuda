@@ -14,11 +14,14 @@ linear-attention layers as Mamba/SSM layers:
   output gates;
 - routed top-8 MoE plus the sigmoid-gated shared expert on every layer;
 - GGML F32/F16/BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, and Q6_K weight layouts;
-- GGUF byte-level BPE tokens and merges, prompt prefill, EOS handling, and a
-  greedy autoregressive decode loop.
+- GGUF byte-level BPE tokens and merges, the exact Qwen3.5 Unicode
+  pre-tokenizer (including combining marks), prompt prefill, EOS handling,
+  and a greedy autoregressive decode loop.
 
-Missing tensors, wrong shapes, unsupported quantization types, invalid token
-IDs, discontinuous cache positions, and non-finite logits are fatal errors.
+Missing tensors, wrong shapes, malformed/overlapping GGUF ranges, unsupported
+quantization types, invalid token IDs or MoE routes, discontinuous cache
+positions, and non-finite logits are fatal errors. Optional MTP tensors are
+not loaded as base-model layers.
 There are no zero-output, pass-through, or fake dry-run fallbacks.
 
 ## Build
@@ -44,10 +47,12 @@ python3 ref/verify_kernels.py --build build \
   --weights /workspace/Qwen3.5-35B-A3B-Q4_K_M.gguf
 ```
 
-The first command checks Q4_K/Q5_K/Q6_K block layouts and the recurrent
-DeltaNet update. The second first checks that the prompt tokenizes to the known
-Qwen IDs `[760, 6511, 314, 9338, 369]`, then runs real end-to-end inference and
-fails unless the generated answer contains `Paris`.
+The first command checks nonuniform Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K block
+layouts, a two-step recurrent DeltaNet update, GGUF RMSNorm semantics,
+split-half partial RoPE, grouped-query attention/cache indexing, and normalized
+MoE routing. The second first checks that the prompt tokenizes to the known Qwen
+IDs `[760, 6511, 314, 9338, 369]`, then runs real end-to-end inference and fails
+unless the generated answer contains `Paris`.
 
 ## Run
 
@@ -64,6 +69,7 @@ to the practical limit of a 24 GB card, so close other GPU workloads first.
 
 ## Correctness references
 
-The layer graph follows the official Qwen3.5 implementation in Hugging Face
-Transformers and the Qwen3.5-MoE GGUF graph in llama.cpp. GGML quantized block
-decoding follows llama.cpp's `ggml-quants.c` layouts.
+The layer graph, converted-tensor semantics, tokenizer regex, and GGML block
+layouts were checked against llama.cpp tag `b9222` (commit `9a532ae4b`). The
+generated Unicode category table under `third_party/llama.cpp` is copied from
+that snapshot and remains covered by its included MIT license.

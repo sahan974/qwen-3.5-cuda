@@ -2,6 +2,7 @@
 #define QWEN_CONFIG_HPP
 
 #include <cstdint>
+#include <cmath>
 #include <stdexcept>
 
 namespace qwen {
@@ -53,15 +54,21 @@ struct ModelConfig {
     }
 
     void validate() const {
-        if (d_model <= 0 || n_layers <= 0 || vocab_size <= 0) throw std::runtime_error("invalid core model dimensions");
-        if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || num_heads % num_kv_heads != 0)
+        if (d_model <= 0 || n_layers <= 0 || vocab_size <= 0 || max_seq_len <= 0)
+            throw std::runtime_error("invalid core model dimensions");
+        if (!(rms_eps > 0.0f) || !std::isfinite(rms_eps) || !(rope_theta > 0.0f) || !std::isfinite(rope_theta))
+            throw std::runtime_error("invalid normalization or RoPE parameters");
+        if (full_attn_interval <= 0) throw std::runtime_error("invalid full-attention interval");
+        if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 || num_heads % num_kv_heads != 0)
             throw std::runtime_error("invalid full-attention head configuration");
         if (partial_rope_dim <= 0 || partial_rope_dim > head_dim || partial_rope_dim % 2)
             throw std::runtime_error("invalid rotary dimension");
         if (gdn_num_k_heads <= 0 || gdn_num_v_heads <= 0 || gdn_num_v_heads % gdn_num_k_heads != 0)
             throw std::runtime_error("invalid GDN head grouping");
-        if (gdn_key_dim <= 0 || gdn_value_dim <= 0 || conv_kernel_size < 2)
+        if (gdn_key_dim <= 0 || gdn_value_dim <= 0 || gdn_value_dim > 256 || conv_kernel_size < 2)
             throw std::runtime_error("invalid GDN dimensions");
+        if (moe_intermediate_dim <= 0 || shared_expert_dim <= 0)
+            throw std::runtime_error("invalid MoE dimensions");
         if (num_experts <= 0 || num_experts_per_tok <= 0 || num_experts_per_tok > num_experts)
             throw std::runtime_error("invalid MoE routing configuration");
     }

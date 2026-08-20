@@ -15,6 +15,7 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp)
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -26,6 +27,7 @@ add_executable(qwen-3.5-cuda
     src/layer_moe.cpp
     src/model.cpp
     src/tokenizer.cpp
+    third_party/llama.cpp/unicode-data.cpp
     src/cuda/matmul_q4.cu
     src/cuda/attn_kernels.cu
     src/cuda/ops.cu
@@ -42,6 +44,10 @@ if(BUILD_TESTING)
         tests/kernel_tests.cu
         src/cuda/matmul_q4.cu
         src/cuda/gdn.cu
+        src/cuda/ops.cu
+        src/cuda/rope.cu
+        src/cuda/attn_kernels.cu
+        src/cuda/moe.cu
     )
     target_link_libraries(qwen-kernel-tests PRIVATE CUDA::cublas CUDA::cudart)
     add_test(NAME qwen-kernel-tests COMMAND qwen-kernel-tests)

@@ -31,7 +31,9 @@ public:
     ~GgufLoader();
 
     bool open(const std::string& filepath);
-    bool load_tensors_to_gpu();
+    // If base_layer_count is non-negative, tensors belonging to blk.N with
+    // N >= base_layer_count (for example Qwen3.5 MTP blocks) stay on disk.
+    bool load_tensors_to_gpu(int base_layer_count = -1);
     void unload_gpu();
     void close();
 

@@ -7,7 +7,11 @@ import sys
 
 def run(cmd):
     print("+", " ".join(map(str, cmd)), flush=True)
-    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True).stdout
+    result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if result.returncode:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+        raise SystemExit(f"command failed with exit code {result.returncode}")
+    return result.stdout
 
 def main():
     ap = argparse.ArgumentParser()

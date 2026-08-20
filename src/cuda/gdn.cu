@@ -28,7 +28,8 @@ __global__ void gates_kernel(const float*b,const float*al,const float*a,const fl
 void gdn_gate_values(const float*b,const float*al,const float*a,const float*dt,float*bo,float*d,int n,cudaStream_t s){gates_kernel<<<(n+255)/256,256,0,s>>>(b,al,a,dt,bo,d,n);CUDA_CHECK(cudaGetLastError());}
 
 __global__ void recurrent_kernel(float*S,const float*q,const float*k,const float*v,const float*beta,const float*decay,float*out,int kh,int vh,int dk,int dv){
-    int h=blockIdx.x, j=threadIdx.x;if(j>=dv)return;int source=h/(vh/kh);const float*qh=q+source*dk;const float*khp=k+source*dk;float*Sh=S+(size_t)h*dk*dv;
+    // Qwen3.5 GGUF tensors tile value heads as [subgroup][key-head].
+    int h=blockIdx.x, j=threadIdx.x;if(j>=dv)return;int source=h%kh;const float*qh=q+source*dk;const float*khp=k+source*dk;float*Sh=S+(size_t)h*dk*dv;
     float mem=0;for(int i=0;i<dk;++i){float&cell=Sh[(size_t)i*dv+j];cell*=decay[h];mem+=khp[i]*cell;}
     float delta=(v[h*dv+j]-mem)*beta[h];for(int i=0;i<dk;++i)Sh[(size_t)i*dv+j]+=khp[i]*delta;
     float o=0;for(int i=0;i<dk;++i)o+=qh[i]*Sh[(size_t)i*dv+j];out[h*dv+j]=o;

@@ -29,7 +29,6 @@ private:
     int bos_token_id_ = -1;
 
     void build_byte_tables();
-    size_t next_chunk(const std::string& text, size_t start) const;
     void encode_chunk(const std::string& chunk, std::vector<int>& out) const;
 };
 

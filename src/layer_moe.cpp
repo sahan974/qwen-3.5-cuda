@@ -1,5 +1,7 @@
 #include "layer_moe.hpp"
 #include "matmul_q4.hpp"
+#include <cmath>
+#include <stdexcept>
 namespace qwen {
 void moe_topk(const float*,int*,float*,int,int,cudaStream_t);void moe_silu_mul(const float*,const float*,float*,int,cudaStream_t);void moe_add(float*,const float*,float,int,cudaStream_t);void moe_shared_add(float*,const float*,const float*,int,cudaStream_t);
 MoeLayer::~MoeLayer(){free_buffers();}
@@ -12,6 +14,7 @@ void MoeLayer::forward(const float*x,float*out,const QuantTensor&r,const QuantTe
  matmul_dispatch(r,x,router_,cfg_.num_experts,cfg_.d_model,ctx.stream());moe_topk(router_,top_idx_,top_weight_,cfg_.num_experts,cfg_.num_experts_per_tok,ctx.stream());
  CUDA_CHECK(cudaMemcpyAsync(h_idx_,top_idx_,cfg_.num_experts_per_tok*sizeof(int),cudaMemcpyDeviceToHost,ctx.stream()));CUDA_CHECK(cudaMemcpyAsync(h_weight_,top_weight_,cfg_.num_experts_per_tok*sizeof(float),cudaMemcpyDeviceToHost,ctx.stream()));CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));CUDA_CHECK(cudaMemsetAsync(accum_,0,cfg_.d_model*sizeof(float),ctx.stream()));
  uint64_t gu_stride=(uint64_t)cfg_.d_model*cfg_.moe_intermediate_dim,down_stride=(uint64_t)cfg_.moe_intermediate_dim*cfg_.d_model;
+ float route_sum=0.0f;for(int j=0;j<cfg_.num_experts_per_tok;++j){if(h_idx_[j]<0||h_idx_[j]>=cfg_.num_experts||!std::isfinite(h_weight_[j])||h_weight_[j]<0.0f)throw std::runtime_error("invalid/non-finite MoE routing result in layer "+std::to_string(layer_idx_));route_sum+=h_weight_[j];}if(!std::isfinite(route_sum)||std::fabs(route_sum-1.0f)>1e-4f)throw std::runtime_error("MoE routing weights are not normalized in layer "+std::to_string(layer_idx_));
  for(int j=0;j<cfg_.num_experts_per_tok;++j){int e=h_idx_[j];matmul_dispatch(eg,x,gate_,cfg_.moe_intermediate_dim,cfg_.d_model,ctx.stream(),e*gu_stride);matmul_dispatch(eu,x,up_,cfg_.moe_intermediate_dim,cfg_.d_model,ctx.stream(),e*gu_stride);moe_silu_mul(gate_,up_,hidden_,cfg_.moe_intermediate_dim,ctx.stream());matmul_dispatch(ed,hidden_,expert_out_,cfg_.d_model,cfg_.moe_intermediate_dim,ctx.stream(),e*down_stride);moe_add(accum_,expert_out_,h_weight_[j],cfg_.d_model,ctx.stream());}
  matmul_dispatch(sgo,x,sgate_,1,cfg_.d_model,ctx.stream());matmul_dispatch(sg,x,shared_gate_,cfg_.shared_expert_dim,cfg_.d_model,ctx.stream());matmul_dispatch(su,x,shared_up_,cfg_.shared_expert_dim,cfg_.d_model,ctx.stream());moe_silu_mul(shared_gate_,shared_up_,shared_hidden_,cfg_.shared_expert_dim,ctx.stream());matmul_dispatch(sd,shared_hidden_,shared_out_,cfg_.d_model,cfg_.shared_expert_dim,ctx.stream());moe_shared_add(accum_,shared_out_,sgate_,cfg_.d_model,ctx.stream());CUDA_CHECK(cudaMemcpyAsync(out,accum_,cfg_.d_model*sizeof(float),cudaMemcpyDeviceToDevice,ctx.stream()));
 }

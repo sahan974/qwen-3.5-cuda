@@ -1,7 +1,7 @@
 #include "cuda_utils.hpp"
 #include <cmath>
 namespace qwen {
-__global__ void topk_kernel(const float*x,int*idx,float*w,int n,int k){if(threadIdx.x)return;for(int j=0;j<k;++j){float best=-INFINITY;int bi=-1;for(int i=0;i<n;++i){bool used=false;for(int p=0;p<j;++p)used|=idx[p]==i;if(!used&&x[i]>best){best=x[i];bi=i;}}idx[j]=bi;w[j]=best;}float mx=w[0];for(int j=1;j<k;++j)mx=fmaxf(mx,w[j]);float sum=0;for(int j=0;j<k;++j){w[j]=expf(w[j]-mx);sum+=w[j];}for(int j=0;j<k;++j)w[j]/=sum;}
+__global__ void topk_kernel(const float*x,int*idx,float*w,int n,int k){if(threadIdx.x)return;for(int i=0;i<n;++i)if(!isfinite(x[i])){idx[0]=-1;w[0]=NAN;return;}for(int j=0;j<k;++j){float best=-INFINITY;int bi=-1;for(int i=0;i<n;++i){bool used=false;for(int p=0;p<j;++p)used|=idx[p]==i;if(!used&&x[i]>best){best=x[i];bi=i;}}idx[j]=bi;w[j]=best;}float mx=w[0];for(int j=1;j<k;++j)mx=fmaxf(mx,w[j]);float sum=0;for(int j=0;j<k;++j){w[j]=expf(w[j]-mx);sum+=w[j];}for(int j=0;j<k;++j)w[j]/=sum;}
 void moe_topk(const float*x,int*idx,float*w,int n,int k,cudaStream_t s){topk_kernel<<<1,1,0,s>>>(x,idx,w,n,k);CUDA_CHECK(cudaGetLastError());}
 __global__ void silu_mul_kernel(const float*g,const float*u,float*h,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)h[i]=(g[i]/(1+expf(-g[i])))*u[i];}
 void moe_silu_mul(const float*g,const float*u,float*h,int n,cudaStream_t s){silu_mul_kernel<<<(n+255)/256,256,0,s>>>(g,u,h,n);CUDA_CHECK(cudaGetLastError());}

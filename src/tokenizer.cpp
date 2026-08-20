@@ -1,6 +1,7 @@
 #include "tokenizer.hpp"
+#include "unicode-data.h"
 #include <algorithm>
-#include <cctype>
+#include <cstdint>
 #include <stdexcept>
 
 namespace qwen {
@@ -30,12 +31,113 @@ bool decode_cp(const std::string& s, size_t& i, uint32_t& cp) {
         cp = ((c & 0x0f) << 12) | ((static_cast<unsigned char>(s[i + 1]) & 0x3f) << 6) |
              (static_cast<unsigned char>(s[i + 2]) & 0x3f); i += 3; return true;
     }
+    if ((c & 0xf8) == 0xf0 && i + 3 < s.size()) {
+        cp = ((c & 0x07) << 18) | ((static_cast<unsigned char>(s[i + 1]) & 0x3f) << 12) |
+             ((static_cast<unsigned char>(s[i + 2]) & 0x3f) << 6) |
+             (static_cast<unsigned char>(s[i + 3]) & 0x3f); i += 4; return true;
+    }
     return false;
 }
 
-bool letter(unsigned char c) { return std::isalpha(c) != 0 || c >= 0x80; }
-bool digit(unsigned char c) { return c >= '0' && c <= '9'; }
-bool space(unsigned char c) { return std::isspace(c) != 0; }
+enum : uint16_t { NUMBER = 0x0002, LETTER = 0x0004, ACCENT_MARK = 0x0010, WHITESPACE = 0x0100 };
+
+uint16_t unicode_flags(uint32_t cp) {
+    if (cp >= MAX_CODEPOINTS) return 0;
+    const auto begin = unicode_ranges_flags.begin();
+    const auto end = unicode_ranges_flags.end();
+    auto it = std::upper_bound(begin, end, cp,
+        [](uint32_t value, const std::pair<uint32_t, uint16_t>& range) { return value < range.first; });
+    uint16_t flags = it == begin ? 0 : std::prev(it)->second;
+    if (unicode_set_whitespace.count(cp)) flags |= WHITESPACE;
+    return flags;
+}
+
+struct Codepoint {
+    uint32_t value;
+    size_t byte_begin;
+    size_t byte_end;
+    uint16_t flags;
+};
+
+std::vector<Codepoint> codepoints(const std::string& text) {
+    std::vector<Codepoint> out;
+    for (size_t i = 0; i < text.size();) {
+        const size_t begin = i;
+        uint32_t cp = 0;
+        if (!decode_cp(text, i, cp) || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
+            throw std::runtime_error("prompt contains invalid UTF-8");
+        out.push_back({cp, begin, i, unicode_flags(cp)});
+    }
+    return out;
+}
+
+bool has(uint16_t flags, uint16_t bit) { return (flags & bit) != 0; }
+
+// Exact custom pre-tokenizer used by Qwen3.5 in llama.cpp b9222. The returned
+// offsets are UTF-8 byte offsets; BPE itself still operates on encoded bytes.
+std::vector<size_t> qwen35_chunk_ends(const std::string& text) {
+    const auto cps = codepoints(text);
+    std::vector<size_t> ends;
+    const auto value = [&](size_t p) { return p < cps.size() ? cps[p].value : UINT32_MAX; };
+    const auto flags = [&](size_t p) { return p < cps.size() ? cps[p].flags : uint16_t{0}; };
+    const auto add = [&](size_t p) { ends.push_back(p < cps.size() ? cps[p].byte_begin : text.size()); };
+
+    for (size_t pos = 0; pos < cps.size();) {
+        const uint32_t cp = value(pos);
+        const uint16_t f = flags(pos);
+
+        // (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (cp == '\'' && pos + 1 < cps.size()) {
+            const auto lower_ascii = [](uint32_t x) { return x >= 'A' && x <= 'Z' ? x + ('a' - 'A') : x; };
+            const uint32_t a = lower_ascii(value(pos + 1));
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') { pos += 2; add(pos); continue; }
+            if (pos + 2 < cps.size()) {
+                const uint32_t b = lower_ascii(value(pos + 2));
+                if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) {
+                    pos += 3; add(pos); continue;
+                }
+            }
+        }
+
+        // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+        if (cp != '\r' && cp != '\n' && !has(f, NUMBER) &&
+            (has(f, LETTER | ACCENT_MARK) || has(flags(pos + 1), LETTER | ACCENT_MARK))) {
+            ++pos;
+            while (has(flags(pos), LETTER | ACCENT_MARK)) ++pos;
+            add(pos); continue;
+        }
+
+        // \p{N}
+        if (has(f, NUMBER)) { ++pos; add(pos); continue; }
+
+        // <space>?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+        uint16_t f2 = cp == ' ' ? flags(pos + 1) : f;
+        const uint16_t excluded = WHITESPACE | LETTER | ACCENT_MARK | NUMBER;
+        if (f != 0 && (f2 & excluded) == 0 && f2 != 0) {
+            pos += cp == ' ';
+            while (f2 != 0 && (f2 & excluded) == 0) f2 = flags(++pos);
+            while (value(pos) == '\r' || value(pos) == '\n') ++pos;
+            add(pos); continue;
+        }
+
+        size_t whitespace = 0;
+        size_t last_newline_end = 0;
+        while (has(flags(pos + whitespace), WHITESPACE)) {
+            const uint32_t x = value(pos + whitespace);
+            if (x == '\r' || x == '\n') last_newline_end = pos + whitespace + 1;
+            ++whitespace;
+        }
+        if (last_newline_end != 0) { pos = last_newline_end; add(pos); continue; }
+        if (whitespace > 1 && value(pos + whitespace) != UINT32_MAX) {
+            pos += whitespace - 1; add(pos); continue;
+        }
+        if (whitespace > 0) { pos += whitespace; add(pos); continue; }
+
+        ++pos;
+        add(pos);
+    }
+    return ends;
+}
 
 } // namespace
 
@@ -77,51 +179,32 @@ bool BPETokenizer::init(const GgufLoader& loader) {
     return true;
 }
 
-size_t BPETokenizer::next_chunk(const std::string& t, size_t i) const {
-    const size_t n = t.size(); const unsigned char c = static_cast<unsigned char>(t[i]);
-    if (c == '\'' && i + 1 < n) {
-        for (const char* form : {"s", "t", "re", "ve", "m", "ll", "d"}) {
-            size_t len = std::char_traits<char>::length(form);
-            if (i + 1 + len <= n) {
-                bool ok = true;
-                for (size_t j = 0; j < len; ++j) ok &= std::tolower(static_cast<unsigned char>(t[i + 1 + j])) == form[j];
-                if (ok) return i + 1 + len;
-            }
-        }
-    }
-    size_t j = i;
-    if (!letter(c) && c != '\r' && c != '\n' && !digit(c) && i + 1 < n && letter(static_cast<unsigned char>(t[i + 1]))) j++;
-    if (letter(static_cast<unsigned char>(t[j]))) { while (++j < n && letter(static_cast<unsigned char>(t[j]))) {} return j; }
-    if (digit(c)) return i + 1;
-    j = i;
-    if (c == ' ' && i + 1 < n) {
-        unsigned char d = static_cast<unsigned char>(t[i + 1]);
-        if (!space(d) && !letter(d) && !digit(d)) ++j;
-    }
-    if (j < n) {
-        unsigned char d = static_cast<unsigned char>(t[j]);
-        if (!space(d) && !letter(d) && !digit(d)) {
-            while (++j < n) { unsigned char e = static_cast<unsigned char>(t[j]); if (space(e) || letter(e) || digit(e)) break; }
-            while (j < n && (t[j] == '\r' || t[j] == '\n')) ++j;
-            return j;
-        }
-    }
-    if (space(c)) { while (++j < n && space(static_cast<unsigned char>(t[j]))) {} return j; }
-    return i + 1;
-}
-
 void BPETokenizer::encode_chunk(const std::string& chunk, std::vector<int>& out) const {
     std::vector<std::string> symbols; symbols.reserve(chunk.size());
     for (unsigned char c : chunk) symbols.push_back(byte_to_unicode_[c]);
     while (symbols.size() > 1) {
-        int best_rank = 0x7fffffff; size_t best = symbols.size();
+        int best_rank = 0x7fffffff;
+        std::string best_left, best_right;
         for (size_t i = 0; i + 1 < symbols.size(); ++i) {
             auto it = bpe_ranks_.find(symbols[i] + " " + symbols[i + 1]);
-            if (it != bpe_ranks_.end() && it->second < best_rank) { best_rank = it->second; best = i; }
+            if (it != bpe_ranks_.end() && it->second < best_rank) {
+                best_rank = it->second; best_left = symbols[i]; best_right = symbols[i + 1];
+            }
         }
-        if (best == symbols.size()) break;
-        symbols[best] += symbols[best + 1];
-        symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best + 1));
+        if (best_rank == 0x7fffffff) break;
+        // GPT-2 BPE merges every non-overlapping occurrence of the selected
+        // pair in one pass. Merging only the first occurrence can change which
+        // lower-rank pair becomes available next and produce different IDs.
+        std::vector<std::string> merged;
+        merged.reserve(symbols.size());
+        for (size_t i = 0; i < symbols.size();) {
+            if (i + 1 < symbols.size() && symbols[i] == best_left && symbols[i + 1] == best_right) {
+                merged.push_back(symbols[i] + symbols[i + 1]); i += 2;
+            } else {
+                merged.push_back(std::move(symbols[i++]));
+            }
+        }
+        symbols = std::move(merged);
     }
     for (const auto& symbol : symbols) {
         auto it = token_to_id_.find(symbol);
@@ -134,7 +217,11 @@ std::vector<int> BPETokenizer::encode(const std::string& text, bool add_bos) con
     if (vocab_.empty()) throw std::runtime_error("tokenizer is not initialized");
     std::vector<int> out;
     if (add_bos && bos_token_id_ >= 0) out.push_back(bos_token_id_);
-    for (size_t i = 0; i < text.size();) { size_t end = next_chunk(text, i); encode_chunk(text.substr(i, end - i), out); i = end; }
+    size_t begin = 0;
+    for (size_t end : qwen35_chunk_ends(text)) {
+        encode_chunk(text.substr(begin, end - begin), out);
+        begin = end;
+    }
     return out;
 }
 

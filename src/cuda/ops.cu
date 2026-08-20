@@ -15,7 +15,8 @@ __device__ __forceinline__ float warp_reduce_sum_ops(float val) {
     return val;
 }
 
-// RMSNorm Kernel with (1 + weight) scaling
+// llama.cpp's Qwen3.5 GGUF converter adds 1 to ordinary RMSNorm weights.
+// GGUF therefore stores the final multiplicative scale, not HF's zero-centered parameter.
 __global__ void rmsnorm_kernel(
     const float* __restrict__ x,
     const float* __restrict__ weight,
@@ -53,7 +54,7 @@ __global__ void rmsnorm_kernel(
 
     float rscale = shared_sum;
     for (int i = tid; i < N; i += blockDim.x) {
-        out[i] = x[i] * rscale * (1.0f + weight[i]);
+        out[i] = x[i] * rscale * weight[i];
     }
 }
 

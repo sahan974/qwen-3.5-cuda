@@ -4,10 +4,34 @@
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
+#include <algorithm>
+#include <limits>
+#include <unordered_set>
 
 namespace qwen {
 
 static constexpr uint32_t GGUF_MAGIC = 0x46554747; // "GGUF" in little-endian
+
+template <typename T>
+T read_scalar(std::ifstream& fin, const char* what) {
+    T value{};
+    fin.read(reinterpret_cast<char*>(&value), sizeof(value));
+    if (!fin) throw std::runtime_error(std::string("truncated GGUF while reading ") + what);
+    return value;
+}
+
+int tensor_block_index(const std::string& name) {
+    if (name.rfind("blk.", 0) != 0) return -1;
+    size_t end = name.find('.', 4);
+    if (end == std::string::npos || end == 4) return -1;
+    int index = 0;
+    for (size_t i = 4; i < end; ++i) {
+        if (name[i] < '0' || name[i] > '9') return -1;
+        if (index > (std::numeric_limits<int>::max() - (name[i] - '0')) / 10) return -1;
+        index = index * 10 + (name[i] - '0');
+    }
+    return index;
+}
 
 GgufLoader::~GgufLoader() {
     close();
@@ -21,22 +45,18 @@ void GgufLoader::close() {
 }
 
 std::string GgufLoader::read_string(std::ifstream& fin) {
-    uint64_t len = 0;
-    fin.read(reinterpret_cast<char*>(&len), sizeof(len));
-    if (!fin.good()) throw std::runtime_error("truncated GGUF string length");
+    const uint64_t len = read_scalar<uint64_t>(fin, "string length");
     if (len > (1ULL << 32)) throw std::runtime_error("unreasonable GGUF string length");
     std::string str(len, '\0');
-    fin.read(&str[0], len);
-    if (!fin.good()) throw std::runtime_error("truncated GGUF string");
+    if (len != 0) fin.read(str.data(), static_cast<std::streamsize>(len));
+    if (!fin) throw std::runtime_error("truncated GGUF string");
     return str;
 }
 
 std::vector<std::string> GgufLoader::read_metadata_array(std::ifstream& fin) {
-    uint32_t raw_type = 0;
-    uint64_t count = 0;
-    fin.read(reinterpret_cast<char*>(&raw_type), sizeof(raw_type));
-    fin.read(reinterpret_cast<char*>(&count), sizeof(count));
-    if (!fin.good() || count > (1ULL << 32)) throw std::runtime_error("invalid GGUF metadata array");
+    const uint32_t raw_type = read_scalar<uint32_t>(fin, "array element type");
+    const uint64_t count = read_scalar<uint64_t>(fin, "array length");
+    if (count > (1ULL << 32)) throw std::runtime_error("invalid GGUF metadata array");
     const auto type = static_cast<GgufMetadataValueType>(raw_type);
     if (type == GgufMetadataValueType::ARRAY) throw std::runtime_error("nested GGUF arrays are unsupported");
     std::vector<std::string> result;
@@ -65,10 +85,9 @@ void GgufLoader::skip_metadata_value(std::ifstream& fin, GgufMetadataValueType v
         case GgufMetadataValueType::STRING:
             read_string(fin); break;
         case GgufMetadataValueType::ARRAY: {
-            uint32_t raw_arr_type = 0;
-            uint64_t arr_len = 0;
-            fin.read(reinterpret_cast<char*>(&raw_arr_type), sizeof(raw_arr_type));
-            fin.read(reinterpret_cast<char*>(&arr_len), sizeof(arr_len));
+            const uint32_t raw_arr_type = read_scalar<uint32_t>(fin, "array element type");
+            const uint64_t arr_len = read_scalar<uint64_t>(fin, "array length");
+            if (arr_len > (1ULL << 32)) throw std::runtime_error("invalid GGUF metadata array length");
             GgufMetadataValueType arr_type = static_cast<GgufMetadataValueType>(raw_arr_type);
             for (uint64_t i = 0; i < arr_len; ++i) {
                 skip_metadata_value(fin, arr_type);
@@ -78,21 +97,22 @@ void GgufLoader::skip_metadata_value(std::ifstream& fin, GgufMetadataValueType v
         default:
             throw std::runtime_error("Unknown GGUF metadata value type");
     }
+    if (!fin) throw std::runtime_error("truncated GGUF metadata value");
 }
 
 std::string GgufLoader::read_metadata_value_as_string(std::ifstream& fin, GgufMetadataValueType vtype) {
     switch (vtype) {
-        case GgufMetadataValueType::UINT8: { uint8_t v; fin.read(reinterpret_cast<char*>(&v), 1); return std::to_string(v); }
-        case GgufMetadataValueType::INT8: { int8_t v; fin.read(reinterpret_cast<char*>(&v), 1); return std::to_string(v); }
-        case GgufMetadataValueType::BOOL: { uint8_t v; fin.read(reinterpret_cast<char*>(&v), 1); return v ? "true" : "false"; }
-        case GgufMetadataValueType::UINT16: { uint16_t v; fin.read(reinterpret_cast<char*>(&v), 2); return std::to_string(v); }
-        case GgufMetadataValueType::INT16: { int16_t v; fin.read(reinterpret_cast<char*>(&v), 2); return std::to_string(v); }
-        case GgufMetadataValueType::UINT32: { uint32_t v; fin.read(reinterpret_cast<char*>(&v), 4); return std::to_string(v); }
-        case GgufMetadataValueType::INT32: { int32_t v; fin.read(reinterpret_cast<char*>(&v), 4); return std::to_string(v); }
-        case GgufMetadataValueType::FLOAT32: { float v; fin.read(reinterpret_cast<char*>(&v), 4); return std::to_string(v); }
-        case GgufMetadataValueType::UINT64: { uint64_t v; fin.read(reinterpret_cast<char*>(&v), 8); return std::to_string(v); }
-        case GgufMetadataValueType::INT64: { int64_t v; fin.read(reinterpret_cast<char*>(&v), 8); return std::to_string(v); }
-        case GgufMetadataValueType::FLOAT64: { double v; fin.read(reinterpret_cast<char*>(&v), 8); return std::to_string(v); }
+        case GgufMetadataValueType::UINT8: return std::to_string(read_scalar<uint8_t>(fin, "uint8 metadata"));
+        case GgufMetadataValueType::INT8: return std::to_string(read_scalar<int8_t>(fin, "int8 metadata"));
+        case GgufMetadataValueType::BOOL: return read_scalar<uint8_t>(fin, "bool metadata") ? "true" : "false";
+        case GgufMetadataValueType::UINT16: return std::to_string(read_scalar<uint16_t>(fin, "uint16 metadata"));
+        case GgufMetadataValueType::INT16: return std::to_string(read_scalar<int16_t>(fin, "int16 metadata"));
+        case GgufMetadataValueType::UINT32: return std::to_string(read_scalar<uint32_t>(fin, "uint32 metadata"));
+        case GgufMetadataValueType::INT32: return std::to_string(read_scalar<int32_t>(fin, "int32 metadata"));
+        case GgufMetadataValueType::FLOAT32: return std::to_string(read_scalar<float>(fin, "float32 metadata"));
+        case GgufMetadataValueType::UINT64: return std::to_string(read_scalar<uint64_t>(fin, "uint64 metadata"));
+        case GgufMetadataValueType::INT64: return std::to_string(read_scalar<int64_t>(fin, "int64 metadata"));
+        case GgufMetadataValueType::FLOAT64: return std::to_string(read_scalar<double>(fin, "float64 metadata"));
         case GgufMetadataValueType::STRING: return read_string(fin);
         case GgufMetadataValueType::ARRAY: {
             throw std::runtime_error("array metadata must be read with read_metadata_array");
@@ -112,22 +132,25 @@ bool GgufLoader::open(const std::string& filepath) {
         return false;
     }
 
-    uint32_t magic = 0;
-    fin.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    const uint32_t magic = read_scalar<uint32_t>(fin, "magic");
     if (magic != GGUF_MAGIC) {
         std::cerr << "Invalid GGUF magic header in file: " << filepath << std::endl;
         return false;
     }
 
-    fin.read(reinterpret_cast<char*>(&version_), sizeof(version_));
-    fin.read(reinterpret_cast<char*>(&tensor_count_), sizeof(tensor_count_));
-    fin.read(reinterpret_cast<char*>(&metadata_count_), sizeof(metadata_count_));
+    version_ = read_scalar<uint32_t>(fin, "version");
+    if (version_ != 2 && version_ != 3) throw std::runtime_error("unsupported GGUF version " + std::to_string(version_));
+    tensor_count_ = read_scalar<uint64_t>(fin, "tensor count");
+    metadata_count_ = read_scalar<uint64_t>(fin, "metadata count");
+    if (tensor_count_ > (1ULL << 24) || metadata_count_ > (1ULL << 24))
+        throw std::runtime_error("unreasonable GGUF header counts");
 
     // Parse metadata
     for (uint64_t i = 0; i < metadata_count_; ++i) {
         std::string key = read_string(fin);
-        uint32_t raw_vtype = 0;
-        fin.read(reinterpret_cast<char*>(&raw_vtype), sizeof(raw_vtype));
+        if (metadata_str_.count(key) || metadata_arrays_.count(key))
+            throw std::runtime_error("duplicate GGUF metadata key: " + key);
+        const uint32_t raw_vtype = read_scalar<uint32_t>(fin, "metadata value type");
         GgufMetadataValueType vtype = static_cast<GgufMetadataValueType>(raw_vtype);
         if (vtype == GgufMetadataValueType::ARRAY) metadata_arrays_[key] = read_metadata_array(fin);
         else metadata_str_[key] = read_metadata_value_as_string(fin, vtype);
@@ -135,31 +158,37 @@ bool GgufLoader::open(const std::string& filepath) {
 
     // Parse tensor info headers
     tensors_.reserve(tensor_count_);
+    std::unordered_set<std::string> names;
     for (uint64_t i = 0; i < tensor_count_; ++i) {
         QuantTensor tensor;
         tensor.name = read_string(fin);
+        if (!names.insert(tensor.name).second) throw std::runtime_error("duplicate GGUF tensor name: " + tensor.name);
         
-        uint32_t n_dimensions = 0;
-        fin.read(reinterpret_cast<char*>(&n_dimensions), sizeof(n_dimensions));
+        const uint32_t n_dimensions = read_scalar<uint32_t>(fin, "tensor dimension count");
+        if (n_dimensions == 0 || n_dimensions > 4) throw std::runtime_error("invalid dimensions for tensor " + tensor.name);
         
         tensor.shape.resize(n_dimensions);
         tensor.num_elements = 1;
         for (uint32_t d = 0; d < n_dimensions; ++d) {
-            fin.read(reinterpret_cast<char*>(&tensor.shape[d]), sizeof(int64_t));
-            tensor.num_elements *= tensor.shape[d];
+            tensor.shape[d] = read_scalar<int64_t>(fin, "tensor dimension");
+            if (tensor.shape[d] <= 0 || tensor.num_elements > std::numeric_limits<uint64_t>::max() / tensor.shape[d])
+                throw std::runtime_error("invalid or overflowing shape for tensor " + tensor.name);
+            tensor.num_elements *= static_cast<uint64_t>(tensor.shape[d]);
         }
 
-        uint32_t raw_type = 0;
-        fin.read(reinterpret_cast<char*>(&raw_type), sizeof(raw_type));
+        const uint32_t raw_type = read_scalar<uint32_t>(fin, "tensor type");
         tensor.type = static_cast<GgmlType>(raw_type);
 
-        fin.read(reinterpret_cast<char*>(&tensor.offset), sizeof(tensor.offset));
+        tensor.offset = read_scalar<uint64_t>(fin, "tensor offset");
 
         tensor.size_bytes = calculate_tensor_bytes(tensor.type, tensor.num_elements);
         if (tensor.size_bytes == 0) {
             throw std::runtime_error("unsupported or malformed tensor '" + tensor.name + "' (GGML type " +
                                      std::to_string(raw_type) + ")");
         }
+        const uint64_t block = ggml_type_block_size(tensor.type);
+        if (block > 1 && static_cast<uint64_t>(tensor.shape[0]) % block != 0)
+            throw std::runtime_error("quantized row width is not block-aligned for tensor " + tensor.name);
 
         tensors_.push_back(tensor);
     }
@@ -168,6 +197,25 @@ bool GgufLoader::open(const std::string& filepath) {
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) throw std::runtime_error("invalid GGUF alignment");
     uint64_t cur_pos = fin.tellg();
     payload_offset_ = (cur_pos + alignment - 1) & ~(alignment - 1);
+
+    fin.seekg(0, std::ios::end);
+    const auto end_pos = fin.tellg();
+    if (end_pos < 0) throw std::runtime_error("could not determine GGUF file size");
+    const uint64_t file_size = static_cast<uint64_t>(end_pos);
+    struct Span { uint64_t begin, end; const std::string* name; };
+    std::vector<Span> spans;
+    spans.reserve(tensors_.size());
+    for (const auto& t : tensors_) {
+        if (t.offset % alignment != 0 || t.offset > std::numeric_limits<uint64_t>::max() - payload_offset_ ||
+            payload_offset_ + t.offset > file_size || t.size_bytes > file_size - (payload_offset_ + t.offset))
+            throw std::runtime_error("invalid data range for tensor " + t.name);
+        spans.push_back({payload_offset_ + t.offset, payload_offset_ + t.offset + t.size_bytes, &t.name});
+    }
+    std::sort(spans.begin(), spans.end(), [](const Span& a, const Span& b) { return a.begin < b.begin; });
+    for (size_t i = 1; i < spans.size(); ++i) {
+        if (spans[i].begin < spans[i - 1].end)
+            throw std::runtime_error("overlapping GGUF tensors: " + *spans[i - 1].name + " and " + *spans[i].name);
+    }
 
     return true;
 }
@@ -182,17 +230,24 @@ void GgufLoader::unload_gpu() {
     total_vram_bytes_ = 0;
 }
 
-bool GgufLoader::load_tensors_to_gpu() {
+bool GgufLoader::load_tensors_to_gpu(int base_layer_count) {
     std::ifstream fin(filepath_, std::ios::binary);
     if (!fin.is_open()) return false;
 
-    total_vram_bytes_ = 0;
+    unload_gpu();
     std::vector<char> buffer;
+    size_t selected = 0;
+    for (const auto& t : tensors_) {
+        const int block = tensor_block_index(t.name);
+        if (base_layer_count < 0 || block < 0 || block < base_layer_count) ++selected;
+    }
 
-    std::cout << "Loading " << tensor_count_ << " tensors into GPU VRAM..." << std::endl;
+    std::cout << "Loading " << selected << " of " << tensor_count_ << " tensors into GPU VRAM..." << std::endl;
 
     for (size_t i = 0; i < tensors_.size(); ++i) {
         auto& t = tensors_[i];
+        const int block = tensor_block_index(t.name);
+        if (base_layer_count >= 0 && block >= base_layer_count) continue;
         
         // Allocate device VRAM
         cudaError_t err = cudaMalloc(&t.device_ptr, t.size_bytes);
@@ -209,8 +264,8 @@ bool GgufLoader::load_tensors_to_gpu() {
             buffer.resize(t.size_bytes);
         }
 
-        fin.read(buffer.data(), t.size_bytes);
-        if (!fin.good()) {
+        fin.read(buffer.data(), static_cast<std::streamsize>(t.size_bytes));
+        if (!fin) {
             std::cerr << "Error reading binary tensor data for: " << t.name << std::endl;
             unload_gpu();
             return false;
@@ -227,7 +282,7 @@ bool GgufLoader::load_tensors_to_gpu() {
         total_vram_bytes_ += t.size_bytes;
     }
 
-    std::cout << "Successfully loaded all tensors. Total VRAM allocated: " 
+    std::cout << "Successfully loaded required tensors. Total VRAM allocated: "
               << (total_vram_bytes_ / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
     return true;
 }

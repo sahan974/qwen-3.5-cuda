@@ -6,7 +6,8 @@
 
 namespace qwen {
 
-// RMSNorm with (1 + weight) scaling: out = norm(x) * (1 + weight)
+// GGUF ordinary RMSNorm weights are already 1-centered by the converter.
+// out = norm(x) * weight
 void rmsnorm_forward(
     const float* x,
     const float* weight,
