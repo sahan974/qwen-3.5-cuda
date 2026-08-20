@@ -157,7 +157,7 @@ void BPETokenizer::build_byte_tables() {
 }
 
 bool BPETokenizer::init(const GgufLoader& loader) {
-    vocab_.clear(); token_to_id_.clear(); bpe_ranks_.clear(); eog_ids_.clear();
+    vocab_.clear(); token_to_id_.clear(); bpe_ranks_.clear(); eog_ids_.clear(); control_ids_.clear(); special_tokens_.clear();
     build_byte_tables();
     const auto* tokens = loader.get_meta_array("tokenizer.ggml.tokens");
     const auto* merges = loader.get_meta_array("tokenizer.ggml.merges");
@@ -169,11 +169,26 @@ bool BPETokenizer::init(const GgufLoader& loader) {
     bpe_ranks_.reserve(merges->size() * 2);
     for (size_t i = 0; i < merges->size(); ++i) bpe_ranks_.emplace((*merges)[i], static_cast<int>(i));
 
+    const auto* token_types = loader.get_meta_array("tokenizer.ggml.token_type");
+    if (token_types && token_types->size() != vocab_.size())
+        throw std::runtime_error("tokenizer.ggml.token_type size differs from vocabulary");
+    if (token_types) {
+        for (size_t i = 0; i < token_types->size(); ++i) {
+            const int type = std::stoi((*token_types)[i]);
+            // GGUF token types: UNKNOWN=2, CONTROL=3, USER_DEFINED=4.
+            if ((type == 2 || type == 3 || type == 4) && !vocab_[i].empty()) special_tokens_.emplace_back(vocab_[i], static_cast<int>(i));
+            if (type == 3) control_ids_.insert(static_cast<int>(i));
+        }
+        std::stable_sort(special_tokens_.begin(), special_tokens_.end(),
+            [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+    }
+
     bos_token_id_ = loader.get_meta_int("tokenizer.ggml.bos_token_id", -1);
     for (const char* key : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"}) {
         int id = loader.get_meta_int(key, -1); if (id >= 0) eog_ids_.insert(id);
     }
-    for (const char* special : {"<|endoftext|>", "<|im_end|>", "<|eot_id|>"}) {
+    for (const char* special : {"<|eot_id|>", "<|im_end|>", "<|end|>", "<|endoftext|>",
+                                "<|eom_id|>", "<|end_of_text|>", "<end_of_turn>"}) {
         auto it = token_to_id_.find(special); if (it != token_to_id_.end()) eog_ids_.insert(it->second);
     }
     return true;
@@ -213,20 +228,49 @@ void BPETokenizer::encode_chunk(const std::string& chunk, std::vector<int>& out)
     }
 }
 
-std::vector<int> BPETokenizer::encode(const std::string& text, bool add_bos) const {
-    if (vocab_.empty()) throw std::runtime_error("tokenizer is not initialized");
-    std::vector<int> out;
-    if (add_bos && bos_token_id_ >= 0) out.push_back(bos_token_id_);
+void BPETokenizer::encode_plain(const std::string& text, std::vector<int>& out) const {
     size_t begin = 0;
     for (size_t end : qwen35_chunk_ends(text)) {
         encode_chunk(text.substr(begin, end - begin), out);
         begin = end;
     }
+}
+
+std::vector<int> BPETokenizer::encode(const std::string& text, bool add_bos, bool parse_special) const {
+    if (vocab_.empty()) throw std::runtime_error("tokenizer is not initialized");
+    std::vector<int> out;
+    if (add_bos && bos_token_id_ >= 0) out.push_back(bos_token_id_);
+    if (!parse_special || special_tokens_.empty()) {
+        encode_plain(text, out);
+        return out;
+    }
+    size_t plain_begin = 0;
+    for (size_t pos = 0; pos < text.size();) {
+        int matched = -1;
+        size_t matched_len = 0;
+        for (const auto& special : special_tokens_) {
+            if (special.first.size() <= text.size() - pos &&
+                text.compare(pos, special.first.size(), special.first) == 0) {
+                matched = special.second; matched_len = special.first.size(); break;
+            }
+        }
+        if (matched < 0) { ++pos; continue; }
+        if (pos > plain_begin) encode_plain(text.substr(plain_begin, pos - plain_begin), out);
+        out.push_back(matched);
+        pos += matched_len;
+        plain_begin = pos;
+    }
+    if (plain_begin < text.size()) encode_plain(text.substr(plain_begin), out);
     return out;
 }
 
+int BPETokenizer::token_id(const std::string& token) const {
+    auto it = token_to_id_.find(token);
+    return it == token_to_id_.end() ? -1 : it->second;
+}
+
 std::string BPETokenizer::decode(int id) const {
-    if (id < 0 || id >= static_cast<int>(vocab_.size()) || eog_ids_.count(id)) return {};
+    if (id < 0 || id >= static_cast<int>(vocab_.size()) || eog_ids_.count(id) || control_ids_.count(id)) return {};
     const std::string& token = vocab_[id];
     if (token.size() >= 3 && token.front() == '<' && token[1] == '|') return token;
     std::string out;

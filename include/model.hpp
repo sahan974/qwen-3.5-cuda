@@ -11,7 +11,10 @@
 namespace qwen {
 class QwenModel {
 public:
-    ~QwenModel();bool init(const ModelConfig&,const GgufLoader&);void free_buffers();int decode_step(int token_id,int pos,const CudaContext&);
+    ~QwenModel();bool init(const ModelConfig&,const GgufLoader&);void free_buffers();
+    const float* decode_logits(int token_id,int pos,const CudaContext&);
+    int decode_step(int token_id,int pos,const CudaContext&);
+    int vocab_size() const { return cfg_.vocab_size; }
 private:
     struct Weights {const QuantTensor *norm=nullptr,*post_norm=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*o=nullptr,*qn=nullptr,*kn=nullptr;
       const QuantTensor *qkv=nullptr,*z=nullptr,*beta=nullptr,*alpha=nullptr,*conv=nullptr,*a=nullptr,*dt=nullptr,*gdn_norm=nullptr,*gdn_out=nullptr;

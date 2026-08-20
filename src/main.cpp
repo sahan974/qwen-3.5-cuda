@@ -2,10 +2,12 @@
 #include "cuda_utils.hpp"
 #include "loader_gguf.hpp"
 #include "model.hpp"
+#include "sampler.hpp"
 #include "tokenizer.hpp"
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 using qwen::QuantTensor;
 namespace {
 const QuantTensor& tensor(const qwen::GgufLoader&l,const std::string&n){auto*t=l.get_tensor(n);if(!t)throw std::runtime_error("cannot derive config; missing "+n);return*t;}
@@ -112,9 +114,34 @@ qwen::ModelConfig config_from(const qwen::GgufLoader& l, int ctx) {
     c.validate();
     return c;
 }
-void usage(const char*p){std::cout<<"Usage: "<<p<<" --weights MODEL.gguf [--prompt TEXT] [--max N] [--ctx N] [--tokenize-only]\n";}
+std::string format_chat_prompt(const qwen::GgufLoader& loader,const qwen::BPETokenizer& tokenizer,
+                               const std::string& user,const std::string& system) {
+    const std::string chat_template=loader.get_meta_string("tokenizer.chat_template");
+    if(chat_template.find("<|im_start|>")==std::string::npos||chat_template.find("<|im_end|>")==std::string::npos)
+        throw std::runtime_error("--chat requires an embedded ChatML tokenizer.chat_template");
+    if(tokenizer.token_id("<|im_start|>")<0||tokenizer.token_id("<|im_end|>")<0)
+        throw std::runtime_error("ChatML special tokens are absent from the vocabulary");
+    std::string out;
+    if(!system.empty())out+="<|im_start|>system\n"+system+"<|im_end|>\n";
+    out+="<|im_start|>user\n"+user+"<|im_end|>\n<|im_start|>assistant\n";
+    return out;
 }
-int main(int argc,char**argv){std::string path,prompt="The capital of France is";int max_tokens=64,ctx_len=4096;bool tokenize_only=false;try{for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--weights"&&i+1<argc)path=argv[++i];else if(a=="--prompt"&&i+1<argc)prompt=argv[++i];else if(a=="--max"&&i+1<argc)max_tokens=std::stoi(argv[++i]);else if(a=="--ctx"&&i+1<argc)ctx_len=std::stoi(argv[++i]);else if(a=="--tokenize-only")tokenize_only=true;else if(a=="--stream"){}else if(a=="--help"){usage(argv[0]);return 0;}else throw std::runtime_error("unknown or incomplete argument: "+a);}if(path.empty())throw std::runtime_error("--weights is required; there is no fake dry-run mode");if(prompt.empty())throw std::runtime_error("prompt must not be empty");if(max_tokens<0||ctx_len<=0)throw std::runtime_error("invalid token/context limit");
- qwen::GgufLoader loader;if(!loader.open(path))return 1;qwen::ModelConfig cfg=config_from(loader,ctx_len);qwen::BPETokenizer tok;tok.init(loader);if(tok.vocab_size()!=cfg.vocab_size)throw std::runtime_error("tokenizer vocabulary and embedding vocabulary differ");auto ids=tok.encode(prompt,false);if(ids.empty())throw std::runtime_error("prompt encoded to zero tokens");if(tokenize_only){std::cout<<"TOKEN_IDS:";for(int id:ids)std::cout<<" "<<id;std::cout<<std::endl;return 0;}if(ids.size()+static_cast<size_t>(max_tokens)>static_cast<size_t>(ctx_len))throw std::runtime_error("prompt plus generation exceeds --ctx");if(!loader.load_tensors_to_gpu(cfg.n_layers))throw std::runtime_error("failed to load required GGUF tensors to the GPU");qwen::CudaContext cuda;qwen::QwenModel model;model.init(cfg,loader);
- std::cout<<prompt<<std::flush;int pos=0,next=-1;for(int id:ids)next=model.decode_step(id,pos++,cuda);auto start=std::chrono::steady_clock::now();int generated=0;while(generated<max_tokens&&!tok.is_eog(next)){std::cout<<tok.decode(next)<<std::flush;++generated;if(generated==max_tokens)break;next=model.decode_step(next,pos++,cuda);}double sec=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();std::cout<<"\n\nGenerated "<<generated<<" tokens in "<<sec<<" s";if(sec>0)std::cout<<" ("<<generated/sec<<" tok/s)";std::cout<<std::endl;return 0;
+void usage(const char*p){std::cout
+ <<"Usage: "<<p<<" --weights MODEL.gguf [options]\n"
+ <<"  --prompt TEXT              raw prompt or chat user message\n"
+ <<"  --chat                     apply embedded ChatML conversation format\n"
+ <<"  --system TEXT              optional system message (requires --chat)\n"
+ <<"  --max N                    maximum generated tokens (default 64)\n"
+ <<"  --ctx N                    context length (default 4096)\n"
+ <<"  --temperature F            0 for greedy, >0 for sampling (default 0)\n"
+ <<"  --top-k N                  sampling candidate limit; 0 disables (default 40)\n"
+ <<"  --top-p F                  nucleus threshold in (0,1] (default 0.95)\n"
+ <<"  --repeat-penalty F         repeated-token penalty >=1 (default 1)\n"
+ <<"  --repeat-last-n N          repetition history window (default 64)\n"
+ <<"  --seed N                   deterministic sampling seed (default 0)\n"
+ <<"  --tokenize-only            print prompt token IDs without loading the GPU\n";}
+}
+int main(int argc,char**argv){std::string path,prompt="The capital of France is",system;int max_tokens=64,ctx_len=4096;bool tokenize_only=false,chat=false;qwen::SamplingConfig sampling;try{for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--weights"&&i+1<argc)path=argv[++i];else if(a=="--prompt"&&i+1<argc)prompt=argv[++i];else if(a=="--system"&&i+1<argc)system=argv[++i];else if(a=="--max"&&i+1<argc)max_tokens=std::stoi(argv[++i]);else if(a=="--ctx"&&i+1<argc)ctx_len=std::stoi(argv[++i]);else if(a=="--temperature"&&i+1<argc)sampling.temperature=std::stof(argv[++i]);else if(a=="--top-k"&&i+1<argc)sampling.top_k=std::stoi(argv[++i]);else if(a=="--top-p"&&i+1<argc)sampling.top_p=std::stof(argv[++i]);else if(a=="--repeat-penalty"&&i+1<argc)sampling.repetition_penalty=std::stof(argv[++i]);else if(a=="--repeat-last-n"&&i+1<argc)sampling.repetition_window=std::stoi(argv[++i]);else if(a=="--seed"&&i+1<argc)sampling.seed=std::stoull(argv[++i]);else if(a=="--chat")chat=true;else if(a=="--tokenize-only")tokenize_only=true;else if(a=="--stream"){}else if(a=="--help"){usage(argv[0]);return 0;}else throw std::runtime_error("unknown or incomplete argument: "+a);}if(path.empty())throw std::runtime_error("--weights is required; there is no fake dry-run mode");if(prompt.empty())throw std::runtime_error("prompt must not be empty");if(!chat&&!system.empty())throw std::runtime_error("--system requires --chat");if(max_tokens<0||ctx_len<=0)throw std::runtime_error("invalid token/context limit");sampling.validate();
+ qwen::GgufLoader loader;if(!loader.open(path))return 1;qwen::ModelConfig cfg=config_from(loader,ctx_len);qwen::BPETokenizer tok;tok.init(loader);if(tok.vocab_size()!=cfg.vocab_size)throw std::runtime_error("tokenizer vocabulary and embedding vocabulary differ");const std::string model_prompt=chat?format_chat_prompt(loader,tok,prompt,system):prompt;auto ids=tok.encode(model_prompt,false,chat);if(ids.empty())throw std::runtime_error("prompt encoded to zero tokens");if(chat&&ids.front()!=tok.token_id("<|im_start|>"))throw std::runtime_error("ChatML control tokens were not parsed atomically; check tokenizer.ggml.token_type");if(tokenize_only){std::cout<<"TOKEN_IDS:";for(int id:ids)std::cout<<" "<<id;std::cout<<std::endl;return 0;}if(ids.size()+static_cast<size_t>(max_tokens)>static_cast<size_t>(ctx_len))throw std::runtime_error("prompt plus generation exceeds --ctx");if(!loader.load_tensors_to_gpu(cfg.n_layers))throw std::runtime_error("failed to load required GGUF tensors to the GPU");qwen::CudaContext cuda;qwen::QwenModel model;model.init(cfg,loader);qwen::Sampler sampler(sampling);
+ if(chat)std::cout<<"Assistant: "<<std::flush;else std::cout<<prompt<<std::flush;int pos=0;const float*logits=nullptr;for(int id:ids)logits=model.decode_logits(id,pos++,cuda);std::vector<int>history=ids;auto start=std::chrono::steady_clock::now();int generated=0;bool stopped_eog=false;while(generated<max_tokens){int next=sampler.sample(logits,model.vocab_size(),history);if(tok.is_eog(next)){stopped_eog=true;break;}std::cout<<tok.decode(next)<<std::flush;history.push_back(next);++generated;if(generated==max_tokens)break;logits=model.decode_logits(next,pos++,cuda);}double sec=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();std::cout<<"\n\nGenerated "<<generated<<" tokens in "<<sec<<" s";if(sec>0)std::cout<<" ("<<generated/sec<<" tok/s)";std::cout<<" [stop: "<<(stopped_eog?"eog":"max-tokens")<<"]\n";return 0;
  }catch(const std::exception&e){std::cerr<<"Fatal: "<<e.what()<<std::endl;return 1;}}

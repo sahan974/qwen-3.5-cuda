@@ -16,7 +16,8 @@ linear-attention layers as Mamba/SSM layers:
 - GGML F32/F16/BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, and Q6_K weight layouts;
 - GGUF byte-level BPE tokens and merges, the exact Qwen3.5 Unicode
   pre-tokenizer (including combining marks), prompt prefill, EOS handling,
-  and a greedy autoregressive decode loop.
+  atomic GGUF special-token parsing, ChatML text conversations, and greedy or
+  temperature/top-k/top-p autoregressive decoding with repetition controls.
 
 Missing tensors, wrong shapes, malformed/overlapping GGUF ranges, unsupported
 quantization types, invalid token IDs or MoE routes, discontinuous cache
@@ -63,6 +64,24 @@ unless the generated answer contains `Paris`.
   --max 16 \
   --ctx 4096
 ```
+
+For a formatted single-turn chat request:
+
+```bash
+./build/qwen-3.5-cuda \
+  --weights /workspace/Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  --chat \
+  --system "You are a concise, accurate assistant." \
+  --prompt "What is the capital of France?" \
+  --max 128 \
+  --temperature 0.7 --top-k 40 --top-p 0.9 \
+  --repeat-penalty 1.05 --repeat-last-n 64 --seed 42
+```
+
+`--chat` is intentionally limited to embedded ChatML templates and fails if
+the GGUF declares a different template. Raw completion remains the default.
+Temperature `0` selects deterministic greedy decoding. Every run reports
+whether generation stopped on an EOG token or the `--max` limit.
 
 The model plus runtime caches must fit in VRAM. A Q4_K_M 35B-A3B GGUF is close
 to the practical limit of a 24 GB card, so close other GPU workloads first.

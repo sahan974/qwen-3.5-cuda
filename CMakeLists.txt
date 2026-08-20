@@ -27,6 +27,7 @@ add_executable(qwen-3.5-cuda
     src/layer_moe.cpp
     src/model.cpp
     src/tokenizer.cpp
+    src/sampler.cpp
     third_party/llama.cpp/unicode-data.cpp
     src/cuda/matmul_q4.cu
     src/cuda/attn_kernels.cu
@@ -40,6 +41,8 @@ target_link_libraries(qwen-3.5-cuda PRIVATE CUDA::cublas CUDA::cudart)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(qwen-sampler-tests tests/sampler_tests.cpp src/sampler.cpp)
+    add_test(NAME qwen-sampler-tests COMMAND qwen-sampler-tests)
     add_executable(qwen-kernel-tests
         tests/kernel_tests.cu
         src/cuda/matmul_q4.cu
