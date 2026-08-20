@@ -169,12 +169,40 @@ CUDA_VISIBLE_DEVICES=0 python3 ref/verify_kernels.py \
   --weights /workspace/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf
 ```
 
+## Benchmark
+
+Measured on one NVIDIA RTX 3090 with the Qwen3.5-35B-A3B Q4_K_M GGUF, a
+36-token prompt, 128 generated tokens, a 4096-token context, and greedy
+decoding. The table reports the median of five runs.
+
+| Metric | Median |
+| --- | ---: |
+| Model load time | 4.837 s |
+| Prompt prefill throughput | 22.301 tok/s |
+| Time to first token | 1.615 s |
+| Generation throughput | 22.215 tok/s |
+| Total inference time | 7.378 s |
+| Observed runtime VRAM allocation | 20,774 MiB |
+
+Run the same benchmark with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./build/qwen-3.5-cuda \
+  --weights /workspace/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  --prompt-file /workspace/benchmark-prompt.txt \
+  --max 128 \
+  --ctx 4096 \
+  --temperature 0 \
+  --benchmark
+```
+
 ## Command-line options
 
 | Option | Description |
 | --- | --- |
 | `--weights PATH` | GGUF model path |
 | `--prompt TEXT` | User prompt or raw completion prefix |
+| `--prompt-file PATH` | Read the prompt from a file |
 | `--chat` | Apply ChatML prompt formatting |
 | `--system TEXT` | System message used with `--chat` |
 | `--max N` | Maximum number of generated tokens |
@@ -185,6 +213,7 @@ CUDA_VISIBLE_DEVICES=0 python3 ref/verify_kernels.py \
 | `--repeat-penalty P` | Penalize tokens appearing in recent history |
 | `--repeat-last-n N` | Number of recent tokens used by repetition penalty |
 | `--seed N` | Sampling random seed |
+| `--benchmark` | Print detailed load and inference measurements |
 | `--tokenize-only` | Print token IDs without running inference |
 
 ## Project layout

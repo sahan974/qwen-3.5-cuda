@@ -5,7 +5,10 @@
 #include "sampler.hpp"
 #include "tokenizer.hpp"
 #include <chrono>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 using qwen::QuantTensor;
@@ -126,9 +129,46 @@ std::string format_chat_prompt(const qwen::GgufLoader& loader,const qwen::BPETok
     out+="<|im_start|>user\n"+user+"<|im_end|>\n<|im_start|>assistant\n";
     return out;
 }
+std::string read_text_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open prompt file: " + path);
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    if (!in.good() && !in.eof()) throw std::runtime_error("cannot read prompt file: " + path);
+    return contents.str();
+}
+double elapsed_ms(std::chrono::steady_clock::time_point begin,
+                  std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+struct VramObserver {
+    bool enabled = false;
+    size_t baseline_used = 0;
+    size_t peak_used = 0;
+
+    explicit VramObserver(bool should_observe) : enabled(should_observe) {
+        if (!enabled) return;
+        size_t free_bytes = 0, total_bytes = 0;
+        CUDA_CHECK(cudaFree(nullptr));
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        baseline_used = total_bytes - free_bytes;
+        peak_used = baseline_used;
+    }
+    void sample() {
+        if (!enabled) return;
+        size_t free_bytes = 0, total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        const size_t used = total_bytes - free_bytes;
+        if (used > peak_used) peak_used = used;
+    }
+    double allocated_mib() const {
+        return static_cast<double>(peak_used - baseline_used) / (1024.0 * 1024.0);
+    }
+};
 void usage(const char*p){std::cout
  <<"Usage: "<<p<<" --weights MODEL.gguf [options]\n"
  <<"  --prompt TEXT              raw prompt or chat user message\n"
+ <<"  --prompt-file PATH         read the prompt from a file\n"
  <<"  --chat                     apply embedded ChatML conversation format\n"
  <<"  --system TEXT              optional system message (requires --chat)\n"
  <<"  --max N                    maximum generated tokens (default 64)\n"
@@ -139,9 +179,11 @@ void usage(const char*p){std::cout
  <<"  --repeat-penalty F         repeated-token penalty >=1 (default 1)\n"
  <<"  --repeat-last-n N          repetition history window (default 64)\n"
  <<"  --seed N                   deterministic sampling seed (default 0)\n"
+ <<"  --benchmark                print detailed load and inference timings\n"
  <<"  --tokenize-only            print prompt token IDs without loading the GPU\n";}
 }
-int main(int argc,char**argv){std::string path,prompt="The capital of France is",system;int max_tokens=64,ctx_len=4096;bool tokenize_only=false,chat=false;qwen::SamplingConfig sampling;try{for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--weights"&&i+1<argc)path=argv[++i];else if(a=="--prompt"&&i+1<argc)prompt=argv[++i];else if(a=="--system"&&i+1<argc)system=argv[++i];else if(a=="--max"&&i+1<argc)max_tokens=std::stoi(argv[++i]);else if(a=="--ctx"&&i+1<argc)ctx_len=std::stoi(argv[++i]);else if(a=="--temperature"&&i+1<argc)sampling.temperature=std::stof(argv[++i]);else if(a=="--top-k"&&i+1<argc)sampling.top_k=std::stoi(argv[++i]);else if(a=="--top-p"&&i+1<argc)sampling.top_p=std::stof(argv[++i]);else if(a=="--repeat-penalty"&&i+1<argc)sampling.repetition_penalty=std::stof(argv[++i]);else if(a=="--repeat-last-n"&&i+1<argc)sampling.repetition_window=std::stoi(argv[++i]);else if(a=="--seed"&&i+1<argc)sampling.seed=std::stoull(argv[++i]);else if(a=="--chat")chat=true;else if(a=="--tokenize-only")tokenize_only=true;else if(a=="--stream"){}else if(a=="--help"){usage(argv[0]);return 0;}else throw std::runtime_error("unknown or incomplete argument: "+a);}if(path.empty())throw std::runtime_error("--weights is required; there is no fake dry-run mode");if(prompt.empty())throw std::runtime_error("prompt must not be empty");if(!chat&&!system.empty())throw std::runtime_error("--system requires --chat");if(max_tokens<0||ctx_len<=0)throw std::runtime_error("invalid token/context limit");sampling.validate();
- qwen::GgufLoader loader;if(!loader.open(path))return 1;qwen::ModelConfig cfg=config_from(loader,ctx_len);qwen::BPETokenizer tok;tok.init(loader);if(tok.vocab_size()!=cfg.vocab_size)throw std::runtime_error("tokenizer vocabulary and embedding vocabulary differ");const std::string model_prompt=chat?format_chat_prompt(loader,tok,prompt,system):prompt;auto ids=tok.encode(model_prompt,false,chat);if(ids.empty())throw std::runtime_error("prompt encoded to zero tokens");if(chat&&ids.front()!=tok.token_id("<|im_start|>"))throw std::runtime_error("ChatML control tokens were not parsed atomically; check tokenizer.ggml.token_type");if(tokenize_only){std::cout<<"TOKEN_IDS:";for(int id:ids)std::cout<<" "<<id;std::cout<<std::endl;return 0;}if(ids.size()+static_cast<size_t>(max_tokens)>static_cast<size_t>(ctx_len))throw std::runtime_error("prompt plus generation exceeds --ctx");if(!loader.load_tensors_to_gpu(cfg.n_layers))throw std::runtime_error("failed to load required GGUF tensors to the GPU");qwen::CudaContext cuda;qwen::QwenModel model;model.init(cfg,loader);qwen::Sampler sampler(sampling);
- if(chat)std::cout<<"Assistant: "<<std::flush;else std::cout<<prompt<<std::flush;int pos=0;const float*logits=nullptr;for(int id:ids)logits=model.decode_logits(id,pos++,cuda);std::vector<int>history=ids;auto start=std::chrono::steady_clock::now();int generated=0;bool stopped_eog=false;while(generated<max_tokens){int next=sampler.sample(logits,model.vocab_size(),history);if(tok.is_eog(next)){stopped_eog=true;break;}std::cout<<tok.decode(next)<<std::flush;history.push_back(next);++generated;if(generated==max_tokens)break;logits=model.decode_logits(next,pos++,cuda);}double sec=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();std::cout<<"\n\nGenerated "<<generated<<" tokens in "<<sec<<" s";if(sec>0)std::cout<<" ("<<generated/sec<<" tok/s)";std::cout<<" [stop: "<<(stopped_eog?"eog":"max-tokens")<<"]\n";return 0;
+int main(int argc,char**argv){std::string path,prompt="The capital of France is",prompt_file,system;int max_tokens=64,ctx_len=4096;bool tokenize_only=false,chat=false,benchmark=false,prompt_set=false;qwen::SamplingConfig sampling;try{for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--weights"&&i+1<argc)path=argv[++i];else if(a=="--prompt"&&i+1<argc){prompt=argv[++i];prompt_set=true;}else if(a=="--prompt-file"&&i+1<argc)prompt_file=argv[++i];else if(a=="--system"&&i+1<argc)system=argv[++i];else if(a=="--max"&&i+1<argc)max_tokens=std::stoi(argv[++i]);else if(a=="--ctx"&&i+1<argc)ctx_len=std::stoi(argv[++i]);else if(a=="--temperature"&&i+1<argc)sampling.temperature=std::stof(argv[++i]);else if(a=="--top-k"&&i+1<argc)sampling.top_k=std::stoi(argv[++i]);else if(a=="--top-p"&&i+1<argc)sampling.top_p=std::stof(argv[++i]);else if(a=="--repeat-penalty"&&i+1<argc)sampling.repetition_penalty=std::stof(argv[++i]);else if(a=="--repeat-last-n"&&i+1<argc)sampling.repetition_window=std::stoi(argv[++i]);else if(a=="--seed"&&i+1<argc)sampling.seed=std::stoull(argv[++i]);else if(a=="--chat")chat=true;else if(a=="--benchmark")benchmark=true;else if(a=="--tokenize-only")tokenize_only=true;else if(a=="--stream"){}else if(a=="--help"){usage(argv[0]);return 0;}else throw std::runtime_error("unknown or incomplete argument: "+a);}if(path.empty())throw std::runtime_error("--weights is required; there is no fake dry-run mode");if(prompt_set&&!prompt_file.empty())throw std::runtime_error("use either --prompt or --prompt-file, not both");if(!prompt_file.empty())prompt=read_text_file(prompt_file);if(prompt.empty())throw std::runtime_error("prompt must not be empty");if(!chat&&!system.empty())throw std::runtime_error("--system requires --chat");if(max_tokens<0||ctx_len<=0)throw std::runtime_error("invalid token/context limit");sampling.validate();
+ const auto gguf_begin=std::chrono::steady_clock::now();qwen::GgufLoader loader;if(!loader.open(path))return 1;const auto gguf_end=std::chrono::steady_clock::now();qwen::ModelConfig cfg=config_from(loader,ctx_len);qwen::BPETokenizer tok;tok.init(loader);if(tok.vocab_size()!=cfg.vocab_size)throw std::runtime_error("tokenizer vocabulary and embedding vocabulary differ");const std::string model_prompt=chat?format_chat_prompt(loader,tok,prompt,system):prompt;auto ids=tok.encode(model_prompt,false,chat);if(ids.empty())throw std::runtime_error("prompt encoded to zero tokens");if(chat&&ids.front()!=tok.token_id("<|im_start|>"))throw std::runtime_error("ChatML control tokens were not parsed atomically; check tokenizer.ggml.token_type");if(tokenize_only){std::cout<<"TOKEN_IDS:";for(int id:ids)std::cout<<" "<<id;std::cout<<std::endl;return 0;}if(ids.size()+static_cast<size_t>(max_tokens)>static_cast<size_t>(ctx_len))throw std::runtime_error("prompt plus generation exceeds --ctx");VramObserver vram(benchmark);const auto tensor_begin=std::chrono::steady_clock::now();if(!loader.load_tensors_to_gpu(cfg.n_layers))throw std::runtime_error("failed to load required GGUF tensors to the GPU");const auto tensor_end=std::chrono::steady_clock::now();vram.sample();const auto init_begin=std::chrono::steady_clock::now();qwen::CudaContext cuda;qwen::QwenModel model;model.init(cfg,loader);qwen::Sampler sampler(sampling);const auto init_end=std::chrono::steady_clock::now();vram.sample();
+ if(chat)std::cout<<"Assistant: "<<std::flush;else std::cout<<prompt<<std::flush;int pos=0;const float*logits=nullptr;const auto inference_begin=std::chrono::steady_clock::now();for(int id:ids)logits=model.decode_logits(id,pos++,cuda);const auto prefill_end=std::chrono::steady_clock::now();vram.sample();std::vector<int>history=ids;int generated=0,decode_steps=0;double decode_compute_ms=0.0;bool stopped_eog=false,first_token_seen=false;std::chrono::steady_clock::time_point first_token_time=prefill_end;while(generated<max_tokens){int next=sampler.sample(logits,model.vocab_size(),history);if(!first_token_seen){first_token_time=std::chrono::steady_clock::now();first_token_seen=true;}if(tok.is_eog(next)){stopped_eog=true;break;}std::cout<<tok.decode(next)<<std::flush;history.push_back(next);++generated;if(generated==max_tokens)break;const auto step_begin=std::chrono::steady_clock::now();logits=model.decode_logits(next,pos++,cuda);const auto step_end=std::chrono::steady_clock::now();decode_compute_ms+=elapsed_ms(step_begin,step_end);++decode_steps;}const auto inference_end=std::chrono::steady_clock::now();vram.sample();const double generation_sec=elapsed_ms(prefill_end,inference_end)/1000.0;std::cout<<"\n\nGenerated "<<generated<<" tokens in "<<generation_sec<<" s";if(generation_sec>0)std::cout<<" ("<<generated/generation_sec<<" tok/s)";std::cout<<" [stop: "<<(stopped_eog?"eog":"max-tokens")<<"]\n";
+ if(benchmark){const double gguf_ms=elapsed_ms(gguf_begin,gguf_end);const double tensor_ms=elapsed_ms(tensor_begin,tensor_end);const double init_ms=elapsed_ms(init_begin,init_end);const double prefill_ms=elapsed_ms(inference_begin,prefill_end);const double decode_ms=elapsed_ms(prefill_end,inference_end);const double total_ms=elapsed_ms(inference_begin,inference_end);std::cout<<std::fixed<<std::setprecision(3)<<"\nBenchmark:\n"<<"gguf_open_ms: "<<gguf_ms<<"\n"<<"tensor_load_ms: "<<tensor_ms<<"\n"<<"model_init_ms: "<<init_ms<<"\n"<<"model_load_ms: "<<elapsed_ms(gguf_begin,init_end)<<"\n"<<"prompt_tokens: "<<ids.size()<<"\n"<<"prefill_ms: "<<prefill_ms<<"\n"<<"prefill_tok_per_s: "<<(prefill_ms>0?ids.size()*1000.0/prefill_ms:0.0)<<"\n"<<"time_to_first_token_ms: "<<(first_token_seen?elapsed_ms(inference_begin,first_token_time):0.0)<<"\n"<<"generated_tokens: "<<generated<<"\n"<<"decode_steps: "<<decode_steps<<"\n"<<"decode_ms: "<<decode_ms<<"\n"<<"decode_compute_ms: "<<decode_compute_ms<<"\n"<<"output_tok_per_s: "<<(decode_ms>0?generated*1000.0/decode_ms:0.0)<<"\n"<<"decode_step_tok_per_s: "<<(decode_compute_ms>0?decode_steps*1000.0/decode_compute_ms:0.0)<<"\n"<<"total_inference_ms: "<<total_ms<<"\n"<<"peak_observed_vram_mib: "<<vram.allocated_mib()<<"\n"<<"stop_reason: "<<(stopped_eog?"eog":"max-tokens")<<"\n";}return 0;
  }catch(const std::exception&e){std::cerr<<"Fatal: "<<e.what()<<std::endl;return 1;}}
