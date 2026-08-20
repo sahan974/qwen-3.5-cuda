@@ -1,94 +1,203 @@
 # qwen-3.5-cuda
 
-A correctness-first C++17/CUDA inference engine for the text stack of
-Qwen3.5-35B-A3B GGUF models on a single CUDA GPU.
+A C++17 and CUDA inference engine for Qwen3.5-35B-A3B GGUF models.
 
-The engine implements the Qwen3.5 hybrid decoder rather than treating its
-linear-attention layers as Mamba/SSM layers:
+The runtime implements the Qwen3.5 hybrid text decoder directly in CUDA and
+loads supported GGUF weights without converting them to a separate runtime
+format.
 
-- 30 recurrent Gated DeltaNet layers with causal depthwise convolution,
-  Q/K L2 normalization, learned decay, delta-rule state updates, and gated
-  per-head RMSNorm;
-- 10 gated grouped-query full-attention layers with joint query/gate
-  projections, Q/K RMSNorm, partial split-half RoPE, KV caching, and sigmoid
-  output gates;
-- routed top-8 MoE plus the sigmoid-gated shared expert on every layer;
-- GGML F32/F16/BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, and Q6_K weight layouts;
-- GGUF byte-level BPE tokens and merges, the exact Qwen3.5 Unicode
-  pre-tokenizer (including combining marks), prompt prefill, EOS handling,
-  atomic GGUF special-token parsing, ChatML text conversations, and greedy or
-  temperature/top-k/top-p autoregressive decoding with repetition controls.
+## Features
 
-Missing tensors, wrong shapes, malformed/overlapping GGUF ranges, unsupported
-quantization types, invalid token IDs or MoE routes, discontinuous cache
-positions, and non-finite logits are fatal errors. Optional MTP tensors are
-not loaded as base-model layers.
-There are no zero-output, pass-through, or fake dry-run fallbacks.
+- Recurrent Gated DeltaNet layers with causal depthwise convolution, Q/K L2
+  normalization, learned decay, delta-rule state updates, and gated per-head
+  RMSNorm
+- Gated grouped-query attention with Q/K RMSNorm, partial split-half RoPE,
+  causal attention, and KV caching
+- Top-k routed MoE layers with normalized routing weights and a sigmoid-gated
+  shared expert
+- F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, and Q6_K GGML weight layouts
+- Qwen3.5 Unicode pre-tokenization, byte-level BPE merges, and atomic GGUF
+  special-token handling
+- Raw text completion and ChatML-formatted chat prompts
+- Greedy decoding and configurable temperature, top-k, top-p, repetition
+  penalty, history window, and deterministic seed
+- Explicit EOG and maximum-token stop reporting
+- GGUF metadata, tensor shape, data range, alignment, and overlap validation
+- Fail-fast handling for missing tensors, unsupported layouts, invalid routing,
+  invalid token IDs, cache-position errors, and non-finite values
+- Optional MTP tensors are detected and excluded from base-model inference
+
+## Requirements
+
+- CMake 3.25 or newer
+- A C++17 compiler
+- NVIDIA CUDA Toolkit 12.x or newer
+- An NVIDIA GPU with enough VRAM for the selected GGUF and runtime caches
 
 ## Build
 
-CUDA Toolkit 12.x and CMake 3.25+ are required.
+Configure the CUDA architecture for the target GPU. For an RTX 3090, use
+architecture `86`:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build -j
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DBUILD_TESTING=ON
+
+cmake --build build -j"$(nproc)"
+```
+
+Common CUDA architectures:
+
+| GPU | Architecture |
+| --- | ---: |
+| A100 | 80 |
+| RTX 3090 | 86 |
+| RTX 4090 | 89 |
+
+## Model
+
+Pass the GGUF file at runtime with `--weights`. The commands below use:
+
+```text
+/workspace/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf
+```
+
+Confirm that the file is available:
+
+```bash
+find /workspace -type f -iname '*.gguf' -printf '%p  %s bytes\n'
+```
+
+## Raw completion
+
+Temperature `0` performs deterministic greedy decoding:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./build/qwen-3.5-cuda \
+  --weights /workspace/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  --prompt "The capital of France is" \
+  --max 64 \
+  --ctx 4096 \
+  --temperature 0
+```
+
+## Chat
+
+Use `--chat` to format the prompt using the ChatML tokens declared by the GGUF
+tokenizer:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./build/qwen-3.5-cuda \
+  --weights /workspace/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  --chat \
+  --system "You are a concise, accurate assistant." \
+  --prompt "Explain why the sky appears blue in three sentences." \
+  --max 512 \
+  --ctx 4096 \
+  --temperature 0.7 \
+  --top-k 40 \
+  --top-p 0.9 \
+  --repeat-penalty 1.05 \
+  --repeat-last-n 64 \
+  --seed 42
+```
+
+Generation ends with an explicit reason:
+
+```text
+[stop: eog]
+```
+
+or:
+
+```text
+[stop: max-tokens]
+```
+
+## Tokenizer check
+
+Inspect prompt token IDs without loading model tensors into GPU memory:
+
+```bash
+./build/qwen-3.5-cuda \
+  --weights /workspace/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  --prompt "The capital of France is" \
+  --tokenize-only
+```
+
+For this prompt, the expected token IDs are:
+
+```text
+760 6511 314 9338 369
+```
+
+Chat tokenization can be checked separately:
+
+```bash
+./build/qwen-3.5-cuda \
+  --weights /workspace/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  --chat \
+  --prompt "What is the capital of France?" \
+  --tokenize-only
+```
+
+## Tests
+
+Run the CTest suite after building:
+
+```bash
 ctest --test-dir build --output-on-failure
 ```
 
-Use architecture `86` for RTX 3090, `89` for RTX 4090, or `80` for A100.
+The tests cover:
 
-## Verify
+- Sampling filters, repetition penalties, deterministic seeding, and stopping
+- Supported quantized block layouts and dequantization
+- Two-step tiled GDN recurrence
+- RMSNorm and Q/K normalization
+- Partial split-half RoPE
+- Grouped-query attention and cache behavior
+- MoE routing and expert computation
 
-The verifier executes compiled CUDA kernels; it does not merely calculate a
-separate reference value.
-
-```bash
-python3 ref/verify_kernels.py --build build
-python3 ref/verify_kernels.py --build build \
-  --weights /workspace/Qwen3.5-35B-A3B-Q4_K_M.gguf
-```
-
-The first command checks nonuniform Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K block
-layouts, a two-step recurrent DeltaNet update, GGUF RMSNorm semantics,
-split-half partial RoPE, grouped-query attention/cache indexing, and normalized
-MoE routing. The second first checks that the prompt tokenizes to the known Qwen
-IDs `[760, 6511, 314, 9338, 369]`, then runs real end-to-end inference and fails
-unless the generated answer contains `Paris`.
-
-## Run
+Run the end-to-end verification helper with a model file:
 
 ```bash
-./build/qwen-3.5-cuda \
-  --weights /workspace/Qwen3.5-35B-A3B-Q4_K_M.gguf \
-  --prompt "The capital of France is" \
-  --max 16 \
-  --ctx 4096
+CUDA_VISIBLE_DEVICES=0 python3 ref/verify_kernels.py \
+  --build build \
+  --weights /workspace/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf
 ```
 
-For a formatted single-turn chat request:
+## Command-line options
 
-```bash
-./build/qwen-3.5-cuda \
-  --weights /workspace/Qwen3.5-35B-A3B-Q4_K_M.gguf \
-  --chat \
-  --system "You are a concise, accurate assistant." \
-  --prompt "What is the capital of France?" \
-  --max 128 \
-  --temperature 0.7 --top-k 40 --top-p 0.9 \
-  --repeat-penalty 1.05 --repeat-last-n 64 --seed 42
-```
+| Option | Description |
+| --- | --- |
+| `--weights PATH` | GGUF model path |
+| `--prompt TEXT` | User prompt or raw completion prefix |
+| `--chat` | Apply ChatML prompt formatting |
+| `--system TEXT` | System message used with `--chat` |
+| `--max N` | Maximum number of generated tokens |
+| `--ctx N` | Context capacity |
+| `--temperature T` | Sampling temperature; `0` selects greedy decoding |
+| `--top-k K` | Keep the K highest-logit candidates |
+| `--top-p P` | Keep the smallest candidate set reaching probability P |
+| `--repeat-penalty P` | Penalize tokens appearing in recent history |
+| `--repeat-last-n N` | Number of recent tokens used by repetition penalty |
+| `--seed N` | Sampling random seed |
+| `--tokenize-only` | Print token IDs without running inference |
 
-`--chat` is intentionally limited to embedded ChatML templates and fails if
-the GGUF declares a different template. Raw completion remains the default.
-Temperature `0` selects deterministic greedy decoding. Every run reports
-whether generation stopped on an EOG token or the `--max` limit.
+## Project layout
 
-The model plus runtime caches must fit in VRAM. A Q4_K_M 35B-A3B GGUF is close
-to the practical limit of a 24 GB card, so close other GPU workloads first.
+| Path | Purpose |
+| --- | --- |
+| `include/` | Runtime interfaces and model data structures |
+| `src/` | GGUF loading, tokenization, model orchestration, and sampling |
+| `src/cuda/` | CUDA kernels for matrix operations, GDN, attention, RoPE, and MoE |
+| `tests/` | CPU and CUDA correctness tests |
+| `ref/` | Verification helpers |
+| `third_party/llama.cpp/` | Vendored Unicode data used by the tokenizer |
 
-## Correctness references
+## References
 
-The layer graph, converted-tensor semantics, tokenizer regex, and GGML block
-layouts were checked against llama.cpp tag `b9222` (commit `9a532ae4b`). The
-generated Unicode category table under `third_party/llama.cpp` is copied from
-that snapshot and remains covered by its included MIT license.
+The vendored Unicode data retains its upstream MIT license notice.
