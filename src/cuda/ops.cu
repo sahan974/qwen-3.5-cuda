@@ -4,6 +4,8 @@
 
 namespace qwen {
 
+// --- Inline Math & Warp Helpers ---
+
 __device__ __forceinline__ float silu(float x) {
     return x / (1.0f + expf(-x));
 }
@@ -15,14 +17,17 @@ __device__ __forceinline__ float warp_reduce_sum_ops(float val) {
     return val;
 }
 
+
+// --- RMSNorm Kernels ---
+
 // llama.cpp's Qwen3.5 GGUF converter adds 1 to ordinary RMSNorm weights.
 // GGUF therefore stores the final multiplicative scale, not HF's zero-centered parameter.
 __global__ void rmsnorm_kernel(
     const float* __restrict__ x,
     const float* __restrict__ weight,
-    float* __restrict__ out,
-    int N,
-    float eps
+    float*       __restrict__ out,
+    int          N,
+    float        eps
 ) {
     int tid = threadIdx.x;
     float sum_sq = 0.0f;
@@ -36,8 +41,8 @@ __global__ void rmsnorm_kernel(
 
     __shared__ float shared_sum;
     int warp_id = tid / 32;
-    static __shared__ float s_warps[32];
 
+    static __shared__ float s_warps[32];
     if (tid % 32 == 0) {
         s_warps[warp_id] = sum_sq;
     }
@@ -46,6 +51,7 @@ __global__ void rmsnorm_kernel(
     if (warp_id == 0) {
         float b_sum = (tid < (blockDim.x / 32)) ? s_warps[tid] : 0.0f;
         b_sum = warp_reduce_sum_ops(b_sum);
+
         if (tid == 0) {
             shared_sum = rsqrtf(b_sum / static_cast<float>(N) + eps);
         }
@@ -63,9 +69,9 @@ __global__ void rmsnorm_gated_kernel(
     const float* __restrict__ x,
     const float* __restrict__ gate,
     const float* __restrict__ weight,
-    float* __restrict__ out,
-    int N,
-    float eps
+    float*       __restrict__ out,
+    int          N,
+    float        eps
 ) {
     int tid = threadIdx.x;
     float sum_sq = 0.0f;
@@ -79,8 +85,8 @@ __global__ void rmsnorm_gated_kernel(
 
     __shared__ float shared_sum;
     int warp_id = tid / 32;
-    static __shared__ float s_warps[32];
 
+    static __shared__ float s_warps[32];
     if (tid % 32 == 0) {
         s_warps[warp_id] = sum_sq;
     }
@@ -89,6 +95,7 @@ __global__ void rmsnorm_gated_kernel(
     if (warp_id == 0) {
         float b_sum = (tid < (blockDim.x / 32)) ? s_warps[tid] : 0.0f;
         b_sum = warp_reduce_sum_ops(b_sum);
+
         if (tid == 0) {
             shared_sum = rsqrtf(b_sum / static_cast<float>(N) + eps);
         }
@@ -101,12 +108,15 @@ __global__ void rmsnorm_gated_kernel(
     }
 }
 
+
+// --- Utility Kernels ---
+
 // Residual Add Kernel
 __global__ void residual_add_kernel(
     const float* __restrict__ x1,
     const float* __restrict__ x2,
-    float* __restrict__ out,
-    int size
+    float*       __restrict__ out,
+    int          size
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
@@ -116,10 +126,10 @@ __global__ void residual_add_kernel(
 
 // Embedding Gather Kernel
 __global__ void encoder_kernel(
-    int token_id,
+    int          token_id,
     const float* __restrict__ embed_table,
-    float* __restrict__ out,
-    int d_model
+    float*       __restrict__ out,
+    int          d_model
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < d_model) {
@@ -127,53 +137,60 @@ __global__ void encoder_kernel(
     }
 }
 
+
+// --- Host Interface Wrappers ---
+
 void rmsnorm_forward(
     const float* x,
     const float* weight,
-    float* out,
-    int N,
-    float eps,
+    float*       out,
+    int          N,
+    float        eps,
     cudaStream_t stream
 ) {
     int threads = (N < 256) ? 128 : 256;
     rmsnorm_kernel<<<1, threads, 0, stream>>>(x, weight, out, N, eps);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void rmsnorm_gated_forward(
     const float* x,
     const float* gate,
     const float* weight,
-    float* out,
-    int N,
-    float eps,
+    float*       out,
+    int          N,
+    float        eps,
     cudaStream_t stream
 ) {
     int threads = (N < 256) ? 128 : 256;
     rmsnorm_gated_kernel<<<1, threads, 0, stream>>>(x, gate, weight, out, N, eps);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void residual_add(
     const float* x1,
     const float* x2,
-    float* out,
-    int size,
+    float*       out,
+    int          size,
     cudaStream_t stream
 ) {
     int threads = 256;
-    int blocks = (size + threads - 1) / threads;
+    int blocks  = (size + threads - 1) / threads;
     residual_add_kernel<<<blocks, threads, 0, stream>>>(x1, x2, out, size);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void encoder_forward(
-    int token_id,
+    int          token_id,
     const float* embed_table,
-    float* out,
-    int d_model,
+    float*       out,
+    int          d_model,
     cudaStream_t stream
 ) {
     int threads = 256;
-    int blocks = (d_model + threads - 1) / threads;
+    int blocks  = (d_model + threads - 1) / threads;
     encoder_kernel<<<blocks, threads, 0, stream>>>(token_id, embed_table, out, d_model);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace qwen
