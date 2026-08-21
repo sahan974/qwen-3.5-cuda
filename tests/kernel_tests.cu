@@ -3,52 +3,470 @@
 #include "ops.hpp"
 #include "rope.hpp"
 #include "cuda_utils.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
-using namespace qwen;
-namespace qwen {
-void attn_split_qg(const float*,float*,float*,int,int,cudaStream_t);
-void attn_head_norm(float*,const float*,int,int,float,cudaStream_t);
-void attn_scores(const float*,const float*,float*,int,int,int,int,cudaStream_t);
-void attn_softmax(float*,int,int,cudaStream_t);
-void attn_values(const float*,const float*,float*,int,int,int,int,cudaStream_t);
-void attn_sigmoid_gate(const float*,const float*,float*,int,cudaStream_t);
-void moe_topk(const float*,int*,float*,int,int,cudaStream_t);
-}
-namespace {
-void check_cuda(bool ok,const char*what){if(!ok)throw std::runtime_error(what);}
-void half_one(std::vector<uint8_t>&b,size_t off){b[off]=0x00;b[off+1]=0x3c;}
-float max_error(const std::vector<float>&a,const std::vector<float>&b){float e=0;for(size_t i=0;i<a.size();++i)e=std::max(e,std::fabs(a[i]-b[i]));return e;}
-const char* quant_name(GgmlType type){switch(type){case GgmlType::Q4_0:return "Q4_0";case GgmlType::Q5_0:return "Q5_0";case GgmlType::Q8_0:return "Q8_0";case GgmlType::Q4_K:return "Q4_K";case GgmlType::Q5_K:return "Q5_K";case GgmlType::Q6_K:return "Q6_K";default:return "unknown";}}
-void test_quant(GgmlType type,std::vector<uint8_t> raw,const std::vector<float>&expected){QuantTensor t;t.name="fixture";t.type=type;t.shape={static_cast<int64_t>(expected.size())};t.num_elements=expected.size();t.size_bytes=raw.size();CUDA_CHECK(cudaMalloc(&t.device_ptr,raw.size()));CUDA_CHECK(cudaMemcpy(t.device_ptr,raw.data(),raw.size(),cudaMemcpyHostToDevice));float*d=nullptr;CUDA_CHECK(cudaMalloc(&d,expected.size()*sizeof(float)));dequantize_row(t,d,0,expected.size());std::vector<float>got(expected.size());CUDA_CHECK(cudaMemcpy(got.data(),d,got.size()*sizeof(float),cudaMemcpyDeviceToHost));cudaFree(d);cudaFree(t.device_ptr);float worst=0.f;size_t wi=0;for(size_t i=0;i<got.size();++i){float e=std::fabs(got[i]-expected[i]);if(!std::isfinite(got[i])||e>worst){worst=e;wi=i;}}if(!std::isfinite(got[wi])||worst>=1e-6f)throw std::runtime_error(std::string(quant_name(type))+" layout mismatch at element "+std::to_string(wi)+": GPU="+std::to_string(got[wi])+", reference="+std::to_string(expected[wi])+", abs_error="+std::to_string(worst));}
-void scale_min_ref(int j,const uint8_t*s,uint8_t&d,uint8_t&m){if(j<4){d=s[j]&63;m=s[j+4]&63;}else{d=(s[j+4]&15)|((s[j-4]>>6)<<4);m=(s[j+4]>>4)|((s[j]>>6)<<4);}}
-void quant_tests(){
- // Each fixture deliberately varies every packed field. These equations are a
- // direct CPU transcription of llama.cpp b9222's dequantize_row_* reference.
- std::vector<uint8_t>q40(18);half_one(q40,0);for(int j=0;j<16;++j)q40[2+j]=static_cast<uint8_t>(((15-j)&15)<<4|(j&15));std::vector<float>r40(32);for(int j=0;j<16;++j){r40[j]=(q40[2+j]&15)-8;r40[j+16]=(q40[2+j]>>4)-8;}test_quant(GgmlType::Q4_0,q40,r40);
- std::vector<uint8_t>q50(22);half_one(q50,0);q50[2]=0x69;q50[3]=0x96;q50[4]=0x3c;q50[5]=0xc3;for(int j=0;j<16;++j)q50[6+j]=static_cast<uint8_t>(((j*5+3)&15)<<4|((j*7+1)&15));uint32_t qh=static_cast<uint32_t>(q50[2])|(static_cast<uint32_t>(q50[3])<<8)|(static_cast<uint32_t>(q50[4])<<16)|(static_cast<uint32_t>(q50[5])<<24);std::vector<float>r50(32);for(int j=0;j<16;++j){r50[j]=static_cast<int>((q50[6+j]&15)|(((qh>>j)&1)<<4))-16;r50[j+16]=static_cast<int>((q50[6+j]>>4)|(((qh>>(j+16))&1)<<4))-16;}test_quant(GgmlType::Q5_0,q50,r50);
- std::vector<uint8_t>q80(34);half_one(q80,0);std::vector<float>r80(32);for(int j=0;j<32;++j){int8_t v=static_cast<int8_t>(j*7-101);q80[2+j]=static_cast<uint8_t>(v);r80[j]=v;}test_quant(GgmlType::Q8_0,q80,r80);
 
- const uint8_t packed_scales[12]={0xc1,0x82,0x43,0x04,0x85,0x46,0x07,0xc8,0x91,0x2a,0xb3,0x4c};
- std::vector<uint8_t>q4(144);half_one(q4,0);q4[2]=0x00;q4[3]=0x38;std::copy(packed_scales,packed_scales+12,q4.begin()+4);for(int j=0;j<128;++j)q4[16+j]=static_cast<uint8_t>(((j*11+5)&15)<<4|((j*3+1)&15));std::vector<float>r4(256);for(int i=0;i<256;++i){uint8_t sc,mn;scale_min_ref(i/32,q4.data()+4,sc,mn);int g=i/64,l=i%32;uint8_t q=q4[16+g*32+l];int v=(i%64)<32?(q&15):(q>>4);r4[i]=sc*v-.5f*mn;}test_quant(GgmlType::Q4_K,q4,r4);
- std::vector<uint8_t>q5(176);half_one(q5,0);q5[2]=0x00;q5[3]=0x38;std::copy(packed_scales,packed_scales+12,q5.begin()+4);for(int j=0;j<32;++j)q5[16+j]=static_cast<uint8_t>(j*37+13);for(int j=0;j<128;++j)q5[48+j]=static_cast<uint8_t>(((j*9+2)&15)<<4|((j*5+7)&15));std::vector<float>r5(256);for(int i=0;i<256;++i){uint8_t sc,mn;scale_min_ref(i/32,q5.data()+4,sc,mn);int g=i/64,l=i%32;uint8_t q=q5[48+g*32+l],mask=1u<<(2*g+((i%64)>=32));int v=((i%64)<32?(q&15):(q>>4))+((q5[16+l]&mask)?16:0);r5[i]=sc*v-.5f*mn;}test_quant(GgmlType::Q5_K,q5,r5);
- std::vector<uint8_t>q6(210);for(int j=0;j<128;++j)q6[j]=static_cast<uint8_t>(j*29+7);for(int j=0;j<64;++j)q6[128+j]=static_cast<uint8_t>(j*43+19);for(int j=0;j<16;++j)q6[192+j]=static_cast<uint8_t>(static_cast<int8_t>(j*9-61));half_one(q6,208);std::vector<float>r6(256);for(int i=0;i<256;++i){int half=i/128,r=i%128,lane=r&31,quarter=r/32;uint8_t lo=quarter==0?(q6[half*64+lane]&15):quarter==1?(q6[half*64+32+lane]&15):quarter==2?(q6[half*64+lane]>>4):(q6[half*64+32+lane]>>4);uint8_t hi=(q6[128+half*32+lane]>>(2*quarter))&3;int si=half*8+lane/16+2*quarter;r6[i]=static_cast<int8_t>(q6[192+si])*(static_cast<int>(lo|(hi<<4))-32);}test_quant(GgmlType::Q6_K,q6,r6);
+using namespace qwen;
+
+namespace qwen {
+// External Kernel Declarations
+void attn_split_qg(const float* qg, float* q, float* gate, int heads, int dim, cudaStream_t stream);
+void attn_head_norm(float* x, const float* weight, int heads, int dim, float eps, cudaStream_t stream);
+void attn_scores(const float* q, const float* k_cache, float* scores, int q_heads, int kv_heads, int dim, int pos, cudaStream_t stream);
+void attn_softmax(float* scores, int heads, int valid_len, cudaStream_t stream);
+void attn_values(const float* scores, const float* v_cache, float* out, int q_heads, int kv_heads, int dim, int pos, cudaStream_t stream);
+void attn_sigmoid_gate(const float* attn, const float* gate, float* out, int dim, cudaStream_t stream);
+void moe_topk(const float* router, int* top_idx, float* top_weight, int experts, int k, cudaStream_t stream);
+} // namespace qwen
+
+namespace {
+
+// --- Test Utilities ---
+
+void check_cuda(bool ok, const char* what) {
+    if (!ok) {
+        throw std::runtime_error(what);
+    }
 }
-void gdn_test(){constexpr int kh=2,vh=4,dk=4,dv=3;std::vector<float>S(vh*dk*dv),q={.2f,.3f,.4f,.5f,-.3f,.1f,.6f,-.2f},k={.1f,-.2f,.3f,.4f,.5f,.2f,-.4f,.1f},v={1,2,3,-1,2,-3,.5f,-.7f,1.2f,2,-1,.25f},beta={.25f,.75f,.4f,.6f},decay={.8f,.9f,.7f,.85f},ref(dv*vh);
- auto cpu_step=[&](){std::fill(ref.begin(),ref.end(),0.f);for(int h=0;h<vh;++h){int source=h%kh;for(int j=0;j<dv;++j){float mem=0;for(int i=0;i<dk;++i){auto&cell=S[(h*dk+i)*dv+j];cell*=decay[h];mem+=k[source*dk+i]*cell;}float delta=(v[h*dv+j]-mem)*beta[h];for(int i=0;i<dk;++i)S[(h*dk+i)*dv+j]+=k[source*dk+i]*delta;for(int i=0;i<dk;++i)ref[h*dv+j]+=q[source*dk+i]*S[(h*dk+i)*dv+j];}}};cpu_step();
- float *ds,*dq,*dkp,*dv_,*db,*dd,*dout;CUDA_CHECK(cudaMalloc(&ds,S.size()*sizeof(float)));CUDA_CHECK(cudaMemset(ds,0,S.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&dq,q.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&dkp,k.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&dv_,v.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&db,beta.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&dd,decay.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&dout,ref.size()*sizeof(float)));
- auto gpu_step=[&](){CUDA_CHECK(cudaMemcpy(dq,q.data(),q.size()*sizeof(float),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(dkp,k.data(),k.size()*sizeof(float),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(dv_,v.data(),v.size()*sizeof(float),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(db,beta.data(),beta.size()*sizeof(float),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(dd,decay.data(),decay.size()*sizeof(float),cudaMemcpyHostToDevice));gdn_recurrent_step(ds,dq,dkp,dv_,db,dd,dout,kh,vh,dk,dv,nullptr);std::vector<float>got(ref.size());CUDA_CHECK(cudaMemcpy(got.data(),dout,got.size()*sizeof(float),cudaMemcpyDeviceToHost));check_cuda(max_error(got,ref)<2e-6f,"GDN recurrent update mismatch");};gpu_step();
- // A second non-zero-state step verifies decay placement and recurrence, which
- // a zero-initialized single-step fixture cannot exercise.
- for(size_t i=0;i<q.size();++i)q[i]=q[i]*-.7f+.11f;for(size_t i=0;i<k.size();++i)k[i]=k[i]*.6f-.08f;for(size_t i=0;i<v.size();++i)v[i]=v[i]*-.35f+.2f;beta={.9f,.15f,.55f,.33f};decay={.5f,.95f,.62f,.77f};cpu_step();gpu_step();
- for(void*p:{ds,dq,dkp,dv_,db,dd,dout})cudaFree(p);}
-void rmsnorm_test(){std::vector<float>x={3.f,4.f},w={2.f,.5f},expected(2);float r=1.f/std::sqrt(12.5f+1e-6f);expected[0]=x[0]*r*w[0];expected[1]=x[1]*r*w[1];float *dx,*dw,*dy;CUDA_CHECK(cudaMalloc(&dx,2*sizeof(float)));CUDA_CHECK(cudaMalloc(&dw,2*sizeof(float)));CUDA_CHECK(cudaMalloc(&dy,2*sizeof(float)));CUDA_CHECK(cudaMemcpy(dx,x.data(),2*sizeof(float),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(dw,w.data(),2*sizeof(float),cudaMemcpyHostToDevice));rmsnorm_forward(dx,dw,dy,2,1e-6f);std::vector<float>got(2);CUDA_CHECK(cudaMemcpy(got.data(),dy,2*sizeof(float),cudaMemcpyDeviceToHost));check_cuda(max_error(got,expected)<1e-5f,"GGUF RMSNorm scale mismatch");cudaFree(dx);cudaFree(dw);cudaFree(dy);}
-void rope_test(){constexpr int heads=2,hd=8,rd=4,pos=3;const float base=100.f;std::vector<float>x(heads*hd),expected;for(size_t i=0;i<x.size();++i)x[i]=.125f*static_cast<float>(i+1);expected=x;for(int h=0;h<heads;++h)for(int i=0;i<rd/2;++i){float theta=pos/std::pow(base,2.f*i/rd),c=std::cos(theta),s=std::sin(theta),a=x[h*hd+i],b=x[h*hd+i+rd/2];expected[h*hd+i]=a*c-b*s;expected[h*hd+i+rd/2]=b*c+a*s;}float*d=nullptr;CUDA_CHECK(cudaMalloc(&d,x.size()*sizeof(float)));CUDA_CHECK(cudaMemcpy(d,x.data(),x.size()*sizeof(float),cudaMemcpyHostToDevice));rope_forward(d,pos,heads,hd,rd,base);std::vector<float>got(x.size());CUDA_CHECK(cudaMemcpy(got.data(),d,got.size()*sizeof(float),cudaMemcpyDeviceToHost));check_cuda(max_error(got,expected)<2e-6f,"split-half partial RoPE mismatch");cudaFree(d);}
-void attention_test(){constexpr int H=4,Hkv=2,D=3,T=3;std::vector<float>q(H*D),k(T*Hkv*D),v(T*Hkv*D);for(size_t i=0;i<q.size();++i)q[i]=.07f*(i+1)-.3f;for(size_t i=0;i<k.size();++i)k[i]=.05f*(i+2)-.2f;for(size_t i=0;i<v.size();++i)v[i]=.09f*(i+1)-.4f;std::vector<float>ref(H*T),out(H*D);for(int h=0;h<H;++h){int kv=h/(H/Hkv);float mx=-INFINITY;for(int t=0;t<T;++t){float z=0;for(int j=0;j<D;++j)z+=q[h*D+j]*k[(t*Hkv+kv)*D+j];ref[h*T+t]=z/std::sqrt(float(D));mx=std::max(mx,ref[h*T+t]);}float sum=0;for(int t=0;t<T;++t)sum+=ref[h*T+t]=std::exp(ref[h*T+t]-mx);for(int t=0;t<T;++t)ref[h*T+t]/=sum;for(int j=0;j<D;++j)for(int t=0;t<T;++t)out[h*D+j]+=ref[h*T+t]*v[(t*Hkv+kv)*D+j];}float *dq,*dk,*dv,*ds,*dout;CUDA_CHECK(cudaMalloc(&dq,q.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&dk,k.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&dv,v.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&ds,ref.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&dout,out.size()*sizeof(float)));CUDA_CHECK(cudaMemcpy(dq,q.data(),q.size()*sizeof(float),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(dk,k.data(),k.size()*sizeof(float),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(dv,v.data(),v.size()*sizeof(float),cudaMemcpyHostToDevice));attn_scores(dq,dk,ds,H,Hkv,D,T-1,nullptr);attn_softmax(ds,H,T,nullptr);attn_values(ds,dv,dout,H,Hkv,D,T-1,nullptr);std::vector<float>got(out.size()),got_scores(ref.size());CUDA_CHECK(cudaMemcpy(got.data(),dout,got.size()*sizeof(float),cudaMemcpyDeviceToHost));CUDA_CHECK(cudaMemcpy(got_scores.data(),ds,got_scores.size()*sizeof(float),cudaMemcpyDeviceToHost));check_cuda(max_error(got_scores,ref)<2e-6f&&max_error(got,out)<2e-6f,"GQA attention/cache indexing mismatch");for(void*p:{dq,dk,dv,ds,dout})cudaFree(p);}
-void routing_test(){std::vector<float>x={-2.f,.4f,3.f,1.2f,-.7f,2.1f};constexpr int K=3;float*dx,*dw;int*di;CUDA_CHECK(cudaMalloc(&dx,x.size()*sizeof(float)));CUDA_CHECK(cudaMalloc(&dw,K*sizeof(float)));CUDA_CHECK(cudaMalloc(&di,K*sizeof(int)));CUDA_CHECK(cudaMemcpy(dx,x.data(),x.size()*sizeof(float),cudaMemcpyHostToDevice));moe_topk(dx,di,dw,x.size(),K,nullptr);std::vector<int>idx(K);std::vector<float>w(K);CUDA_CHECK(cudaMemcpy(idx.data(),di,K*sizeof(int),cudaMemcpyDeviceToHost));CUDA_CHECK(cudaMemcpy(w.data(),dw,K*sizeof(float),cudaMemcpyDeviceToHost));check_cuda(idx==std::vector<int>({2,5,3}),"MoE top-k indices mismatch");float sum=0;for(float z:w){check_cuda(std::isfinite(z)&&z>0,"invalid MoE route weight");sum+=z;}check_cuda(std::fabs(sum-1.f)<1e-6f&&w[0]>w[1]&&w[1]>w[2],"MoE route normalization mismatch");cudaFree(dx);cudaFree(dw);cudaFree(di);}
+
+void half_one(std::vector<uint8_t>& b, size_t off) {
+    b[off]     = 0x00;
+    b[off + 1] = 0x3c;
 }
-int main(){try{quant_tests();gdn_test();rmsnorm_test();rope_test();attention_test();routing_test();std::cout<<"PASS: quant layouts, GDN recurrence, norms, RoPE, GQA attention, and MoE routing\n";return 0;}catch(const std::exception&e){std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}}
+
+float max_error(const std::vector<float>& a, const std::vector<float>& b) {
+    float e = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        e = std::max(e, std::fabs(a[i] - b[i]));
+    }
+    return e;
+}
+
+const char* quant_name(GgmlType type) {
+    switch (type) {
+        case GgmlType::Q4_0: return "Q4_0";
+        case GgmlType::Q5_0: return "Q5_0";
+        case GgmlType::Q8_0: return "Q8_0";
+        case GgmlType::Q4_K: return "Q4_K";
+        case GgmlType::Q5_K: return "Q5_K";
+        case GgmlType::Q6_K: return "Q6_K";
+        default:             return "unknown";
+    }
+}
+
+// --- Quantization Tests ---
+
+void test_quant(GgmlType type, std::vector<uint8_t> raw, const std::vector<float>& expected) {
+    QuantTensor t;
+    t.name         = "fixture";
+    t.type         = type;
+    t.shape        = {static_cast<int64_t>(expected.size())};
+    t.num_elements = expected.size();
+    t.size_bytes   = raw.size();
+
+    CUDA_CHECK(cudaMalloc(&t.device_ptr, raw.size()));
+    CUDA_CHECK(cudaMemcpy(t.device_ptr, raw.data(), raw.size(), cudaMemcpyHostToDevice));
+
+    float* d = nullptr;
+    CUDA_CHECK(cudaMalloc(&d, expected.size() * sizeof(float)));
+
+    dequantize_row(t, d, 0, expected.size());
+
+    std::vector<float> got(expected.size());
+    CUDA_CHECK(cudaMemcpy(got.data(), d, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    cudaFree(d);
+    cudaFree(t.device_ptr);
+
+    float worst = 0.f;
+    size_t wi = 0;
+
+    for (size_t i = 0; i < got.size(); ++i) {
+        float e = std::fabs(got[i] - expected[i]);
+        if (!std::isfinite(got[i]) || e > worst) {
+            worst = e;
+            wi = i;
+        }
+    }
+
+    if (!std::isfinite(got[wi]) || worst >= 1e-6f) {
+        throw std::runtime_error(std::string(quant_name(type)) +
+                                 " layout mismatch at element " + std::to_string(wi) +
+                                 ": GPU=" + std::to_string(got[wi]) +
+                                 ", reference=" + std::to_string(expected[wi]) +
+                                 ", abs_error=" + std::to_string(worst));
+    }
+}
+
+void scale_min_ref(int j, const uint8_t* s, uint8_t& d, uint8_t& m) {
+    if (j < 4) {
+        d = s[j] & 63;
+        m = s[j + 4] & 63;
+    } else {
+        d = (s[j + 4] & 15) | ((s[j - 4] >> 6) << 4);
+        m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4);
+    }
+}
+
+void quant_tests() {
+    // Each fixture deliberately varies every packed field. These equations are a
+    // direct CPU transcription of llama.cpp b9222's dequantize_row_* reference.
+
+    // Q4_0
+    std::vector<uint8_t> q40(18);
+    half_one(q40, 0);
+    for (int j = 0; j < 16; ++j) q40[2 + j] = static_cast<uint8_t>(((15 - j) & 15) << 4 | (j & 15));
+
+    std::vector<float> r40(32);
+    for (int j = 0; j < 16; ++j) {
+        r40[j]      = (q40[2 + j] & 15) - 8;
+        r40[j + 16] = (q40[2 + j] >> 4) - 8;
+    }
+    test_quant(GgmlType::Q4_0, q40, r40);
+
+    // Q5_0
+    std::vector<uint8_t> q50(22);
+    half_one(q50, 0);
+    q50[2] = 0x69; q50[3] = 0x96; q50[4] = 0x3c; q50[5] = 0xc3;
+    for (int j = 0; j < 16; ++j) q50[6 + j] = static_cast<uint8_t>(((j * 5 + 3) & 15) << 4 | ((j * 7 + 1) & 15));
+
+    uint32_t qh = static_cast<uint32_t>(q50[2]) | (static_cast<uint32_t>(q50[3]) << 8) |
+                  (static_cast<uint32_t>(q50[4]) << 16) | (static_cast<uint32_t>(q50[5]) << 24);
+
+    std::vector<float> r50(32);
+    for (int j = 0; j < 16; ++j) {
+        r50[j]      = static_cast<int>((q50[6 + j] & 15) | (((qh >> j) & 1) << 4)) - 16;
+        r50[j + 16] = static_cast<int>((q50[6 + j] >> 4) | (((qh >> (j + 16)) & 1) << 4)) - 16;
+    }
+    test_quant(GgmlType::Q5_0, q50, r50);
+
+    // Q8_0
+    std::vector<uint8_t> q80(34);
+    half_one(q80, 0);
+    std::vector<float> r80(32);
+    for (int j = 0; j < 32; ++j) {
+        int8_t v = static_cast<int8_t>(j * 7 - 101);
+        q80[2 + j] = static_cast<uint8_t>(v);
+        r80[j] = v;
+    }
+    test_quant(GgmlType::Q8_0, q80, r80);
+
+    const uint8_t packed_scales[12] = {0xc1, 0x82, 0x43, 0x04, 0x85, 0x46, 0x07, 0xc8, 0x91, 0x2a, 0xb3, 0x4c};
+
+    // Q4_K
+    std::vector<uint8_t> q4(144);
+    half_one(q4, 0);
+    q4[2] = 0x00; q4[3] = 0x38;
+    std::copy(packed_scales, packed_scales + 12, q4.begin() + 4);
+    for (int j = 0; j < 128; ++j) q4[16 + j] = static_cast<uint8_t>(((j * 11 + 5) & 15) << 4 | ((j * 3 + 1) & 15));
+
+    std::vector<float> r4(256);
+    for (int i = 0; i < 256; ++i) {
+        uint8_t sc, mn;
+        scale_min_ref(i / 32, q4.data() + 4, sc, mn);
+        int g = i / 64, l = i % 32;
+        uint8_t q = q4[16 + g * 32 + l];
+        int v = (i % 64) < 32 ? (q & 15) : (q >> 4);
+        r4[i] = sc * v - .5f * mn;
+    }
+    test_quant(GgmlType::Q4_K, q4, r4);
+
+    // Q5_K
+    std::vector<uint8_t> q5(176);
+    half_one(q5, 0);
+    q5[2] = 0x00; q5[3] = 0x38;
+    std::copy(packed_scales, packed_scales + 12, q5.begin() + 4);
+    for (int j = 0; j < 32; ++j) q5[16 + j] = static_cast<uint8_t>(j * 37 + 13);
+    for (int j = 0; j < 128; ++j) q5[48 + j] = static_cast<uint8_t>(((j * 9 + 2) & 15) << 4 | ((j * 5 + 7) & 15));
+
+    std::vector<float> r5(256);
+    for (int i = 0; i < 256; ++i) {
+        uint8_t sc, mn;
+        scale_min_ref(i / 32, q5.data() + 4, sc, mn);
+        int g = i / 64, l = i % 32;
+        uint8_t q = q5[48 + g * 32 + l];
+        uint8_t mask = 1u << (2 * g + ((i % 64) >= 32));
+        int v = ((i % 64) < 32 ? (q & 15) : (q >> 4)) + ((q5[16 + l] & mask) ? 16 : 0);
+        r5[i] = sc * v - .5f * mn;
+    }
+    test_quant(GgmlType::Q5_K, q5, r5);
+
+    // Q6_K
+    std::vector<uint8_t> q6(210);
+    for (int j = 0; j < 128; ++j) q6[j] = static_cast<uint8_t>(j * 29 + 7);
+    for (int j = 0; j < 64; ++j) q6[128 + j] = static_cast<uint8_t>(j * 43 + 19);
+    for (int j = 0; j < 16; ++j) q6[192 + j] = static_cast<uint8_t>(static_cast<int8_t>(j * 9 - 61));
+    half_one(q6, 208);
+
+    std::vector<float> r6(256);
+    for (int i = 0; i < 256; ++i) {
+        int half = i / 128;
+        int r = i % 128;
+        int lane = r & 31;
+        int quarter = r / 32;
+
+        uint8_t lo = quarter == 0 ? (q6[half * 64 + lane] & 15) :
+                     quarter == 1 ? (q6[half * 64 + 32 + lane] & 15) :
+                     quarter == 2 ? (q6[half * 64 + lane] >> 4) :
+                                    (q6[half * 64 + 32 + lane] >> 4);
+
+        uint8_t hi = (q6[128 + half * 32 + lane] >> (2 * quarter)) & 3;
+        int si = half * 8 + lane / 16 + 2 * quarter;
+        r6[i] = static_cast<int8_t>(q6[192 + si]) * (static_cast<int>(lo | (hi << 4)) - 32);
+    }
+    test_quant(GgmlType::Q6_K, q6, r6);
+}
+
+// --- Structural Kernel Tests ---
+
+void gdn_test() {
+    constexpr int kh = 2, vh = 4, dk = 4, dv = 3;
+    std::vector<float> S(vh * dk * dv);
+    std::vector<float> q = {.2f, .3f, .4f, .5f, -.3f, .1f, .6f, -.2f};
+    std::vector<float> k = {.1f, -.2f, .3f, .4f, .5f, .2f, -.4f, .1f};
+    std::vector<float> v = {1, 2, 3, -1, 2, -3, .5f, -.7f, 1.2f, 2, -1, .25f};
+    std::vector<float> beta = {.25f, .75f, .4f, .6f};
+    std::vector<float> decay = {.8f, .9f, .7f, .85f};
+    std::vector<float> ref(dv * vh);
+
+    auto cpu_step = [&]() {
+        std::fill(ref.begin(), ref.end(), 0.f);
+        for (int h = 0; h < vh; ++h) {
+            int source = h % kh;
+            for (int j = 0; j < dv; ++j) {
+                float mem = 0;
+                for (int i = 0; i < dk; ++i) {
+                    auto& cell = S[(h * dk + i) * dv + j];
+                    cell *= decay[h];
+                    mem += k[source * dk + i] * cell;
+                }
+                float delta = (v[h * dv + j] - mem) * beta[h];
+                for (int i = 0; i < dk; ++i) {
+                    S[(h * dk + i) * dv + j] += k[source * dk + i] * delta;
+                }
+                for (int i = 0; i < dk; ++i) {
+                    ref[h * dv + j] += q[source * dk + i] * S[(h * dk + i) * dv + j];
+                }
+            }
+        }
+    };
+    cpu_step();
+
+    float *ds, *dq, *dkp, *dv_, *db, *dd, *dout;
+    CUDA_CHECK(cudaMalloc(&ds,   S.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemset(ds, 0, S.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dq,   q.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dkp,  k.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dv_,  v.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&db,   beta.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dd,   decay.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dout, ref.size() * sizeof(float)));
+
+    auto gpu_step = [&]() {
+        CUDA_CHECK(cudaMemcpy(dq,  q.data(),     q.size() * sizeof(float),     cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dkp, k.data(),     k.size() * sizeof(float),     cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dv_, v.data(),     v.size() * sizeof(float),     cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(db,  beta.data(),  beta.size() * sizeof(float),  cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dd,  decay.data(), decay.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+        gdn_recurrent_step(ds, dq, dkp, dv_, db, dd, dout, kh, vh, dk, dv, nullptr);
+
+        std::vector<float> got(ref.size());
+        CUDA_CHECK(cudaMemcpy(got.data(), dout, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+        check_cuda(max_error(got, ref) < 2e-6f, "GDN recurrent update mismatch");
+    };
+    gpu_step();
+
+    // A second non-zero-state step verifies decay placement and recurrence, which
+    // a zero-initialized single-step fixture cannot exercise.
+    for (size_t i = 0; i < q.size(); ++i) q[i] = q[i] * -.7f + .11f;
+    for (size_t i = 0; i < k.size(); ++i) k[i] = k[i] * .6f - .08f;
+    for (size_t i = 0; i < v.size(); ++i) v[i] = v[i] * -.35f + .2f;
+
+    beta  = {.9f, .15f, .55f, .33f};
+    decay = {.5f, .95f, .62f, .77f};
+
+    cpu_step();
+    gpu_step();
+
+    for (void* p : {ds, dq, dkp, dv_, db, dd, dout}) cudaFree(p);
+}
+
+void rmsnorm_test() {
+    std::vector<float> x = {3.f, 4.f};
+    std::vector<float> w = {2.f, .5f};
+    std::vector<float> expected(2);
+
+    float r = 1.f / std::sqrt(12.5f + 1e-6f);
+    expected[0] = x[0] * r * w[0];
+    expected[1] = x[1] * r * w[1];
+
+    float *dx, *dw, *dy;
+    CUDA_CHECK(cudaMalloc(&dx, 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dw, 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dy, 2 * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(dx, x.data(), 2 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dw, w.data(), 2 * sizeof(float), cudaMemcpyHostToDevice));
+
+    rmsnorm_forward(dx, dw, dy, 2, 1e-6f);
+
+    std::vector<float> got(2);
+    CUDA_CHECK(cudaMemcpy(got.data(), dy, 2 * sizeof(float), cudaMemcpyDeviceToHost));
+    check_cuda(max_error(got, expected) < 1e-5f, "GGUF RMSNorm scale mismatch");
+
+    cudaFree(dx); cudaFree(dw); cudaFree(dy);
+}
+
+void rope_test() {
+    constexpr int heads = 2, hd = 8, rd = 4, pos = 3;
+    const float base = 100.f;
+
+    std::vector<float> x(heads * hd);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = .125f * static_cast<float>(i + 1);
+
+    std::vector<float> expected = x;
+
+    for (int h = 0; h < heads; ++h) {
+        for (int i = 0; i < rd / 2; ++i) {
+            float theta = pos / std::pow(base, 2.f * i / rd);
+            float c = std::cos(theta);
+            float s = std::sin(theta);
+            float a = x[h * hd + i];
+            float b = x[h * hd + i + rd / 2];
+            expected[h * hd + i]          = a * c - b * s;
+            expected[h * hd + i + rd / 2] = b * c + a * s;
+        }
+    }
+
+    float* d = nullptr;
+    CUDA_CHECK(cudaMalloc(&d, x.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    rope_forward(d, pos, heads, hd, rd, base);
+
+    std::vector<float> got(x.size());
+    CUDA_CHECK(cudaMemcpy(got.data(), d, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    check_cuda(max_error(got, expected) < 2e-6f, "split-half partial RoPE mismatch");
+    cudaFree(d);
+}
+
+void attention_test() {
+    constexpr int H = 4, Hkv = 2, D = 3, T = 3;
+    std::vector<float> q(H * D), k(T * Hkv * D), v(T * Hkv * D);
+
+    for (size_t i = 0; i < q.size(); ++i) q[i] = .07f * (i + 1) - .3f;
+    for (size_t i = 0; i < k.size(); ++i) k[i] = .05f * (i + 2) - .2f;
+    for (size_t i = 0; i < v.size(); ++i) v[i] = .09f * (i + 1) - .4f;
+
+    std::vector<float> ref(H * T), out(H * D);
+
+    for (int h = 0; h < H; ++h) {
+        int kv = h / (H / Hkv);
+        float mx = -INFINITY;
+
+        for (int t = 0; t < T; ++t) {
+            float z = 0;
+            for (int j = 0; j < D; ++j) {
+                z += q[h * D + j] * k[(t * Hkv + kv) * D + j];
+            }
+            ref[h * T + t] = z / std::sqrt(float(D));
+            mx = std::max(mx, ref[h * T + t]);
+        }
+
+        float sum = 0;
+        for (int t = 0; t < T; ++t) {
+            ref[h * T + t] = std::exp(ref[h * T + t] - mx);
+            sum += ref[h * T + t];
+        }
+
+        for (int t = 0; t < T; ++t) {
+            ref[h * T + t] /= sum;
+        }
+
+        for (int j = 0; j < D; ++j) {
+            for (int t = 0; t < T; ++t) {
+                out[h * D + j] += ref[h * T + t] * v[(t * Hkv + kv) * D + j];
+            }
+        }
+    }
+
+    float *dq, *dk, *dv, *ds, *dout;
+    CUDA_CHECK(cudaMalloc(&dq,   q.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dk,   k.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dv,   v.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ds,   ref.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dout, out.size() * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(dq, q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dk, k.data(), k.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dv, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    attn_scores(dq, dk, ds, H, Hkv, D, T - 1, nullptr);
+    attn_softmax(ds, H, T, nullptr);
+    attn_values(ds, dv, dout, H, Hkv, D, T - 1, nullptr);
+
+    std::vector<float> got(out.size()), got_scores(ref.size());
+    CUDA_CHECK(cudaMemcpy(got.data(),        dout, got.size() * sizeof(float),        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(got_scores.data(), ds,   got_scores.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    check_cuda(max_error(got_scores, ref) < 2e-6f && max_error(got, out) < 2e-6f, "GQA attention/cache indexing mismatch");
+    for (void* p : {dq, dk, dv, ds, dout}) cudaFree(p);
+}
+
+void routing_test() {
+    std::vector<float> x = {-2.f, .4f, 3.f, 1.2f, -.7f, 2.1f};
+    constexpr int K = 3;
+
+    float *dx, *dw;
+    int *di;
+    CUDA_CHECK(cudaMalloc(&dx, x.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dw, K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&di, K * sizeof(int)));
+
+    CUDA_CHECK(cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice));
+    moe_topk(dx, di, dw, x.size(), K, nullptr);
+
+    std::vector<int> idx(K);
+    std::vector<float> w(K);
+    CUDA_CHECK(cudaMemcpy(idx.data(), di, K * sizeof(int),   cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(w.data(),   dw, K * sizeof(float), cudaMemcpyDeviceToHost));
+
+    check_cuda(idx == std::vector<int>({2, 5, 3}), "MoE top-k indices mismatch");
+
+    float sum = 0;
+    for (float z : w) {
+        check_cuda(std::isfinite(z) && z > 0, "invalid MoE route weight");
+        sum += z;
+    }
+
+    check_cuda(std::fabs(sum - 1.f) < 1e-6f && w[0] > w[1] && w[1] > w[2], "MoE route normalization mismatch");
+
+    cudaFree(dx); cudaFree(dw); cudaFree(di);
+}
+} // anonymous namespace
+
+// --- Main Test Runner ---
+int main() {
+    try {
+        quant_tests();
+        gdn_test();
+        rmsnorm_test();
+        rope_test();
+        attention_test();
+        routing_test();
+
+        std::cout << "PASS: quant layouts, GDN recurrence, norms, RoPE, GQA attention, and MoE routing\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL: " << e.what() << "\n";
+        return 1;
+    }
+}

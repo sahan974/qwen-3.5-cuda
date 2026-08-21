@@ -6,13 +6,29 @@
 
 namespace qwen {
 
+// --- Compatibility Check ---
 bool matmul_type_supported(GgmlType type);
-void matmul_dispatch(const QuantTensor& weight, const float* x, float* y,
-                     int M, int K, cudaStream_t stream = nullptr,
-                     uint64_t element_offset = 0);
-void dequantize_row(const QuantTensor& tensor, float* out, int row, int cols,
-                    cudaStream_t stream = nullptr);
+
+// --- Matrix Multiplication ---
+void matmul_dispatch(
+    const QuantTensor& weight,
+    const float*       x,
+    float*             y,
+    int                M,
+    int                K,
+    cudaStream_t       stream         = nullptr,
+    uint64_t           element_offset = 0
+);
+
+// --- Dequantization Utility ---
+void dequantize_row(
+    const QuantTensor& tensor,
+    float*             out,
+    int                row,
+    int                cols,
+    cudaStream_t       stream = nullptr
+);
 
 } // namespace qwen
 
-#endif
+#endif // QWEN_MATMUL_Q4_HPP
